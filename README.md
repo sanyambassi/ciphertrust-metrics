@@ -16,8 +16,6 @@ Docs: [Prometheus Metrics](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cd
 
 **Prerequisites:** [Docker](https://docs.docker.com/get-docker/) (Desktop, Rancher Desktop, or Docker Engine). No Python install required.
 
-The published image includes the app, UI, vendored healthcheck scripts, and **Linux `ksctl`**. You start with an empty database and add your own CipherTrust Managers in the UI.
-
 ### Quick start
 
 ```bash
