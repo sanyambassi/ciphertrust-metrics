@@ -30,5 +30,3 @@ includes Linux `ksctl`, so no download is needed inside the published image.
 1. Download `ksctl_images.zip` from any CM: `/downloads/ksctl_images.zip`
 2. Place the binary here as `ksctl-linux-amd64`, `ksctl.exe`, etc.
 3. Or install `ksctl` on your `PATH`
-
-Do **not** commit these binaries — they are large and covered by Thales licensing.
