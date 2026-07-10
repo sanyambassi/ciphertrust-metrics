@@ -1,0 +1,275 @@
+import { state, getDom } from "./state.js";
+import {
+  applyChartDefaults,
+  syncThemeButton,
+  setTheme,
+  currentTheme,
+} from "./theme.js";
+import { fetchJSON, refreshStatus } from "./api.js";
+import {
+  setDashboardLoader,
+  setDashboardChrome,
+  openModal,
+  closeModal,
+  closeEditModal,
+  submitEditForm,
+  setApplianceMenuOpen,
+  renderApplianceMenu,
+  renderApplianceList,
+  selectAppliance,
+  showAppliancesTab,
+  loadAppliances,
+  handleApplianceAction,
+  renderFleetHealth,
+} from "./appliances.js";
+import {
+  showHealthcheckTab,
+  stopHealthcheckPoll,
+  refreshHealthcheckStatus,
+  syncHealthcheckReportTheme,
+} from "./healthcheck.js";
+import {
+  groupForDashboard,
+  persistTabChip,
+  destroyCharts,
+  syncWorkspaceChrome,
+  showDashboardGroup,
+  loadDashboard,
+  setTimeRange,
+  syncRangePicker,
+  tick,
+  schedule,
+} from "./dashboard.js";
+
+const dom = getDom();
+const {
+  primaryTabs,
+  secondaryChips,
+  btnApplianceCurrent,
+  applianceMenu,
+  applianceSelector,
+  applianceTree,
+  modal,
+  form,
+  formError,
+  btnConnect,
+  btnRefresh,
+  autoRefresh,
+  statusText,
+} = dom;
+
+setDashboardLoader(loadDashboard);
+setDashboardChrome({ destroyCharts, syncWorkspaceChrome });
+
+applyChartDefaults();
+syncThemeButton();
+state.groupId = groupForDashboard(state.dashboardId);
+
+document.getElementById("btn-theme")?.addEventListener("click", () => {
+  setTheme(currentTheme() === "light" ? "dark" : "light", {
+    onRefreshCharts: () => {
+      if (state.viewMode === "dashboard") {
+        loadDashboard(state.dashboardId, { forceFull: true });
+      } else if (state.viewMode === "appliances") {
+        renderFleetHealth();
+      } else if (state.viewMode === "healthcheck") {
+        syncHealthcheckReportTheme();
+      }
+    },
+  });
+});
+
+primaryTabs?.addEventListener("click", (e) => {
+  const btn = e.target.closest(".primary-tab");
+  if (!btn) return;
+  const groupId = btn.dataset.group;
+  if (!groupId) return;
+  if (groupId === "appliances") {
+    if (state.viewMode === "appliances") return;
+    stopHealthcheckPoll();
+    showAppliancesTab();
+    return;
+  }
+  if (groupId === "healthcheck") {
+    if (state.viewMode === "healthcheck") return;
+    destroyCharts();
+    showHealthcheckTab();
+    syncWorkspaceChrome();
+    return;
+  }
+  if (state.viewMode === "dashboard" && groupId === state.groupId) return;
+  stopHealthcheckPoll();
+  showDashboardGroup(groupId);
+});
+
+secondaryChips?.addEventListener("click", (e) => {
+  const btn = e.target.closest(".secondary-chip");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (!id || id === state.dashboardId) return;
+  persistTabChip(state.groupId, id);
+  state.panelMeta = null;
+  loadDashboard(id, { forceFull: true });
+});
+
+document.getElementById("range-picker")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-range]");
+  if (!btn) return;
+  const rangeId = btn.dataset.range;
+  if (!rangeId || rangeId === state.rangeId) return;
+  setTimeRange(rangeId, { reload: true });
+});
+
+document.getElementById("fleet-range-picker")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-range]");
+  if (!btn) return;
+  const rangeId = btn.dataset.range;
+  if (!rangeId || rangeId === state.rangeId) return;
+  setTimeRange(rangeId, { reload: true });
+});
+
+btnApplianceCurrent?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!state.menuOpen) renderApplianceMenu();
+  setApplianceMenuOpen(!state.menuOpen);
+});
+
+applianceMenu?.addEventListener("click", async (e) => {
+  const link = e.target.closest("[data-action='open-appliances']");
+  if (link) {
+    e.preventDefault();
+    setApplianceMenuOpen(false);
+    showAppliancesTab();
+    return;
+  }
+  const item = e.target.closest(".appliance-menu-item");
+  if (!item) return;
+  await selectAppliance(item.dataset.id);
+});
+
+document.addEventListener("click", (e) => {
+  if (!state.menuOpen) return;
+  if (applianceSelector?.contains(e.target)) return;
+  setApplianceMenuOpen(false);
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (state.menuOpen) setApplianceMenuOpen(false);
+  if (editModal && !editModal.hidden) closeEditModal();
+});
+
+applianceTree?.addEventListener("click", async (e) => {
+  if (await handleApplianceAction(e)) return;
+  const select = e.target.closest(".tree-node-select, .tree-node");
+  if (!select || e.target.closest(".tree-node-actions, .appliance-edit, .appliance-delete, .appliance-retry")) return;
+  const node = select.closest(".tree-node") || select;
+  const id = Number(node.dataset.id);
+  if (!id) return;
+  state.applianceId = id;
+  state.panelMeta = null;
+  setApplianceMenuOpen(false);
+  renderApplianceList(true);
+  // Open Overview for the selected node (leave Appliances fleet view).
+  showDashboardGroup("overview");
+  refreshStatus();
+});
+
+document.getElementById("btn-add")?.addEventListener("click", openModal);
+document.getElementById("btn-add-tree")?.addEventListener("click", openModal);
+document.getElementById("btn-cancel").addEventListener("click", closeModal);
+modal.addEventListener("click", (e) => {
+  if (e.target === modal) closeModal();
+});
+
+const editModal = document.getElementById("edit-modal");
+const editForm = document.getElementById("edit-form");
+document.getElementById("btn-edit-cancel")?.addEventListener("click", closeEditModal);
+editModal?.addEventListener("click", (e) => {
+  if (e.target === editModal) closeEditModal();
+});
+editForm?.addEventListener("submit", (e) => {
+  submitEditForm(e);
+});
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  formError.hidden = true;
+  btnConnect.disabled = true;
+  btnConnect.textContent = "Connecting…";
+  const fd = new FormData(form);
+  const body = {
+    host: fd.get("host"),
+    username: fd.get("username"),
+    password: fd.get("password"),
+    display_name: fd.get("display_name") || undefined,
+    location: fd.get("location") || undefined,
+    discover_cluster: fd.get("discover_cluster") === "on",
+  };
+  try {
+    const result = await fetchJSON("/api/appliances", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    form.reset();
+    closeModal();
+    state.panelMeta = null;
+    await loadAppliances();
+    state.applianceId = result.appliance?.id || state.applianceId;
+    renderApplianceList(true);
+    if (state.viewMode === "dashboard") {
+      await loadDashboard(state.dashboardId, { forceFull: true });
+    } else {
+      showAppliancesTab();
+    }
+    await refreshStatus();
+    if (result.auto_added?.length) {
+      statusText.textContent = `added + ${result.auto_added.length} peer(s)`;
+    }
+  } catch (err) {
+    formError.hidden = false;
+    const payload = err.payload || {};
+    if (payload.code === "prometheus_permission" || /cannot enable prometheus/i.test(err.message || "")) {
+      formError.textContent =
+        payload.error ||
+        "This account cannot enable Prometheus metrics. Ask an admin to enable it under Admin Settings > Metrics, then re-add the appliance.";
+    } else {
+      formError.textContent = err.message || "Connection failed";
+    }
+  } finally {
+    btnConnect.disabled = false;
+    btnConnect.textContent = "Connect";
+  }
+});
+
+btnRefresh.addEventListener("click", async () => {
+  btnRefresh.disabled = true;
+  const prevLabel = btnRefresh.textContent;
+  btnRefresh.textContent = "Refreshing...";
+  try {
+    if (state.viewMode === "healthcheck") {
+      await refreshHealthcheckStatus();
+      return;
+    }
+    if (state.applianceId) {
+      await fetchJSON(`/api/appliances/${state.applianceId}/scrape?force=1`, {
+        method: "POST",
+      }).catch(() => null);
+    } else {
+      await fetchJSON("/api/scrape", { method: "POST" }).catch(() => null);
+    }
+    await tick({ forceFull: true, scrape: false });
+  } finally {
+    btnRefresh.disabled = false;
+    btnRefresh.textContent = prevLabel || "Refresh";
+  }
+});
+
+autoRefresh.addEventListener("change", schedule);
+
+showAppliancesTab();
+syncRangePicker();
+loadAppliances().then((list) => {
+  if (!list.length) openModal();
+}).then(() => tick({ forceFull: true, scrape: false })).then(schedule);
