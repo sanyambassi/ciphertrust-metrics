@@ -401,12 +401,41 @@ function fleetGridColor() {
   return isLight ? "rgba(15, 23, 42, 0.06)" : "rgba(148, 163, 184, 0.10)";
 }
 
+function fleetTooltipStyle() {
+  // Explicit pairs so Online/Offline labels stay high-contrast in both themes.
+  // (Do not use --muted for body text, and do not reference --panel — it does not exist.)
+  const isLight = document.documentElement.getAttribute("data-theme") === "light";
+  if (isLight) {
+    return {
+      backgroundColor: "#ffffff",
+      titleColor: "#152033",
+      bodyColor: "#152033",
+      borderColor: "#d5dee8",
+      borderWidth: 1,
+      padding: 10,
+      displayColors: true,
+      multiKeyBackground: "#ffffff",
+    };
+  }
+  return {
+    backgroundColor: "#1a2740",
+    titleColor: "#e8eef9",
+    bodyColor: "#e8eef9",
+    borderColor: "#3a4d6b",
+    borderWidth: 1,
+    padding: 10,
+    displayColors: true,
+    multiKeyBackground: "#1a2740",
+  };
+}
+
 function paintFleetHealthChart(points) {
   const { fleetHealthChart: canvas } = getDom();
   if (!canvas || typeof Chart === "undefined") return;
   const okColor = cssVar("--ok", "#34d399");
   const offColor = cssVar("--danger", "#f87171");
   const muted = cssVar("--muted", "#8b9bb8");
+  const tip = fleetTooltipStyle();
   const xBounds = fleetXBounds();
   const online = (points || []).map((p) => ({ x: p.t * 1000, y: p.online }));
   const offline = (points || []).map((p) => ({ x: p.t * 1000, y: p.offline }));
@@ -475,14 +504,7 @@ function paintFleetHealthChart(points) {
     },
   };
 
-  if (state.fleetHealthChart && !state.fleetHealthChart.destroyed) {
-    state.fleetHealthChart.data.datasets = datasets;
-    Object.assign(state.fleetHealthChart.options.scales.x, scaleOpts.x);
-    Object.assign(state.fleetHealthChart.options.scales.y, scaleOpts.y);
-    try { state.fleetHealthChart.update("none"); } catch (_) { /* ignore */ }
-    return;
-  }
-
+  // Always recreate so theme switches (dark ↔ light) fully refresh tooltip colors.
   destroyFleetHealthChart();
   state.fleetHealthChart = new Chart(canvas, {
     type: "line",
@@ -510,19 +532,14 @@ function paintFleetHealthChart(points) {
           },
         },
         tooltip: {
-          backgroundColor: cssVar("--panel", "#151f33"),
-          titleColor: cssVar("--text", "#e8eefc"),
-          bodyColor: muted,
-          borderColor: cssVar("--border", "#243049"),
-          borderWidth: 1,
-          padding: 10,
-          displayColors: true,
+          ...tip,
           callbacks: {
             title: (items) => {
               const x = items[0]?.parsed?.x;
               return x == null ? "" : new Date(x).toLocaleString();
             },
             label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y}`,
+            labelTextColor: () => tip.bodyColor,
           },
         },
       },
