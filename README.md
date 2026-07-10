@@ -160,14 +160,6 @@ See [`tools/README.md`](tools/README.md) for manual install / building the image
 
 Passwords are encrypted at rest with Fernet keyed from `SECRET_KEY` (auto-generated on first run if unset).
 
-## Security notes
-
-- The Docker image does **not** contain `.env`, databases, or CM credentials.
-- Never commit `.env` or `data/` — they hold `SECRET_KEY` and encrypted appliance passwords.
-- Image Hub: https://hub.docker.com/r/sanyambassi/ciphertrust-metrics
-
 ## License
 
 This project is released under the [MIT License](LICENSE).
-
-Bundled `ksctl` / CipherTrust tooling remains under Thales / CipherTrust terms; see the notes in [`LICENSE`](LICENSE).
