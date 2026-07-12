@@ -69,8 +69,9 @@
                         <strong>Updated:</strong> {{ format_readable_date(ca.get("updatedAt")) }}
                     </td>
                     <td style="font-size:0.8rem; line-height:1.4;">
-                        <strong>Client Auth:</strong> <span style="color: {{ 'var(--pass-color)' if ca.get('purpose', {}).get('client_authentication') == 'Enabled' else 'var(--text-secondary)' }}">{{ ca.get("purpose", {}).get("client_authentication", "Disabled") }}</span><br>
-                        <strong>User Auth:</strong> <span style="color: {{ 'var(--pass-color)' if ca.get('purpose', {}).get('user_authentication') == 'Enabled' else 'var(--text-secondary)' }}">{{ ca.get("purpose", {}).get("user_authentication", "Disabled") }}</span>
+                        {% set purpose = ca.get("purpose") or {} %}
+                        <strong>Client Auth:</strong> <span style="color: {{ 'var(--pass-color)' if purpose.get('client_authentication') == 'Enabled' else 'var(--text-secondary)' }}">{{ purpose.get("client_authentication", "Disabled") }}</span><br>
+                        <strong>User Auth:</strong> <span style="color: {{ 'var(--pass-color)' if purpose.get('user_authentication') == 'Enabled' else 'var(--text-secondary)' }}">{{ purpose.get("user_authentication", "Disabled") }}</span>
                     </td>
                     <td>
                         {% set trusting = ca_to_interfaces.get(ca.get("uri"), []) %}
