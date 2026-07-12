@@ -10,6 +10,22 @@ Standalone multi-appliance web app for **CipherTrust Manager** Prometheus metric
 
 Docs: [Prometheus Metrics](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cdsp-cm/page/admin/cm_admin/monitoring/metrics/index.html) · [REST Auth](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cdsp-cm/page/admin/cm_admin/authentication/rest-api/index.html)
 
+## Screenshots
+
+Full set (dark + light): [`docs/screenshots/`](docs/screenshots/)
+
+![Appliances / Fleet](docs/screenshots/01-appliances-fleet.png)
+
+![Overview](docs/screenshots/02-overview.png)
+
+![Ops · Interfaces security posture](docs/screenshots/06-ops-interfaces.png)
+
+![Host metrics](docs/screenshots/04-host-metrics.png)
+
+![CCKM / Cloud Keys](docs/screenshots/09-connectors-cckm.png)
+
+![Overview (light theme)](docs/screenshots/11-overview-light.png)
+
 ---
 
 ## Deploy with Docker (recommended)
