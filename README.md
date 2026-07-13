@@ -10,7 +10,7 @@ Standalone multi-appliance web app for **CipherTrust Manager** Prometheus metric
 
 Docs: [Prometheus Metrics](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cdsp-cm/page/admin/cm_admin/monitoring/metrics/index.html) · [REST Auth](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cdsp-cm/page/admin/cm_admin/authentication/rest-api/index.html)
 
-**Healthcheck only?** If you only need CipherTrust Manager diagnostic healthchecks (without the metrics dashboards), use Stephen O’Connor’s standalone [CipherTrust Healthcheck Reporter](https://github.com/soconnor73/healthcheck). This project embeds a similar healthcheck flow in the UI for convenience when you are already managing appliances here.
+**Healthcheck only?** CipherTrust Metrics and Stephen O’Connor’s [CipherTrust Healthcheck Reporter](https://github.com/soconnor73/healthcheck) are independent projects. If you only need diagnostic healthchecks, refer to or deploy that project instead — you do not need this metrics app.
 
 ## Screenshots
 
