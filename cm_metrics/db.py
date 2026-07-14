@@ -202,6 +202,7 @@ def init_db() -> None:
                 ("public_host", "TEXT"),
                 ("private_host", "TEXT"),
                 ("location", "TEXT"),
+                ("cm_uptime", "TEXT"),
             ):
                 try:
                     conn.execute(f"ALTER TABLE appliances ADD COLUMN {col} {typedef}")
@@ -460,7 +461,7 @@ def update_appliance_auth(
 
 
 def update_appliance_system_info(appliance_id: int, info: dict[str, Any] | None) -> None:
-    """Persist /v1/system/info fields for Overview (version, model, etc.)."""
+    """Persist /v1/system/info fields for Overview (version, model, uptime, etc.)."""
     if not info:
         return
     init_db()
@@ -470,6 +471,9 @@ def update_appliance_system_info(appliance_id: int, info: dict[str, Any] | None)
     vendor = info.get("vendor")
     crypto_version = info.get("crypto_version")
     serial = info.get("chassis_serial_number") or info.get("serial_number")
+    uptime = info.get("uptime")
+    if uptime is not None:
+        uptime = str(uptime).strip() or None
     with connect() as conn:
         conn.execute(
             """
@@ -480,6 +484,7 @@ def update_appliance_system_info(appliance_id: int, info: dict[str, Any] | None)
                 cm_vendor = COALESCE(?, cm_vendor),
                 cm_crypto_version = COALESCE(?, cm_crypto_version),
                 cm_chassis_serial = COALESCE(?, cm_chassis_serial),
+                cm_uptime = COALESCE(?, cm_uptime),
                 system_info_at = ?,
                 updated_at = ?
             WHERE id = ?
@@ -491,6 +496,7 @@ def update_appliance_system_info(appliance_id: int, info: dict[str, Any] | None)
                 vendor,
                 crypto_version,
                 serial,
+                uptime,
                 time.time(),
                 time.time(),
                 appliance_id,
@@ -546,6 +552,7 @@ def update_appliance_scrape(
     sample_count: int = 0,
     error: str | None = None,
     source: str = "live",
+    mark_offline: bool = False,
 ) -> None:
     init_db()
     now = time.time()
@@ -562,7 +569,10 @@ def update_appliance_scrape(
                 status = "ok"
                 err = None
             else:
-                fail_count = prev_fails + 1
+                if mark_offline:
+                    fail_count = max(prev_fails + 1, OFFLINE_FAIL_THRESHOLD)
+                else:
+                    fail_count = prev_fails + 1
                 status = "offline" if fail_count >= OFFLINE_FAIL_THRESHOLD else "error"
                 err = error
                 if status == "offline" and err:
@@ -590,19 +600,40 @@ def update_appliance_scrape(
 
 
 def reset_appliance_failures(appliance_id: int) -> None:
-    """Clear fail counter / offline flag so the next scrape is attempted."""
+    """Clear fail counter so a scrape is attempted.
+
+    Keep last_status as-is (usually 'offline') until the scrape writes ok/error —
+    flipping to 'pending' left appliances stuck when a scrape was interrupted.
+    """
     init_db()
     with connect() as conn:
         conn.execute(
             """
             UPDATE appliances
             SET fail_count = 0,
-                last_status = CASE WHEN last_status = 'offline' THEN 'pending' ELSE last_status END,
                 updated_at = ?
             WHERE id = ?
             """,
             (time.time(), appliance_id),
         )
+
+
+def recover_stuck_pending(*, max_age_seconds: float = 120.0) -> int:
+    """Flip leftover 'pending' rows to error after a crash/restart mid-Refresh."""
+    init_db()
+    cutoff = time.time() - max_age_seconds
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE appliances
+            SET last_status = 'error',
+                last_error = COALESCE(last_error, 'Refresh interrupted — click Refresh to retry'),
+                updated_at = ?
+            WHERE last_status = 'pending' AND updated_at < ?
+            """,
+            (time.time(), cutoff),
+        )
+        return int(cur.rowcount or 0)
 
 
 def is_appliance_offline(appliance: dict[str, Any] | None) -> bool:
@@ -784,7 +815,12 @@ def insert_metric_points(
     appliance_id: int,
     points: list[tuple[str, str, dict[str, str], float, float]],
 ) -> None:
-    """points: (fingerprint, metric_name, labels, ts, value)"""
+    """points: (fingerprint, metric_name, labels, ts, value)
+
+    Intentionally does NOT take the module-wide writer lock. Metric history
+    inserts can take a long time on large DBs; holding `_lock` blocked Refresh
+    status updates (appliances stuck offline/pending for minutes).
+    """
     if not points:
         return
     init_db()
@@ -792,18 +828,26 @@ def insert_metric_points(
         (appliance_id, fp, name, json.dumps(labels, sort_keys=True), ts, value)
         for fp, name, labels, ts, value in points
     ]
-
-    def _do() -> None:
-        with connect() as conn:
-            conn.executemany(
-                """
-                INSERT INTO metric_points (appliance_id, fingerprint, metric_name, labels_json, ts, value)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-
-    _retry_locked(_do)
+    last: Exception | None = None
+    for i in range(8):
+        try:
+            with connect(timeout=30.0) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO metric_points (appliance_id, fingerprint, metric_name, labels_json, ts, value)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+            return
+        except sqlite3.OperationalError as exc:
+            last = exc
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            time.sleep(0.15 * (i + 1))
+    assert last is not None
+    raise last
 
 
 def load_series(
@@ -878,6 +922,39 @@ def load_latest_samples(appliance_id: int, max_age_seconds: float = 120.0) -> li
             "v": r["value"],
         }
     return list(by_fp.values())
+
+
+def load_latest_gauge(appliance_id: int, metric_name: str) -> float | None:
+    """Latest value for one gauge metric — cheap indexed lookup (no full hydrate)."""
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT value FROM metric_points
+            WHERE appliance_id = ? AND metric_name = ?
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (appliance_id, metric_name),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return float(row["value"])
+    except (TypeError, ValueError):
+        return None
+
+
+def appliance_uptime_seconds(appliance_id: int) -> float | None:
+    """Host uptime from latest node_* gauges without hydrating series history."""
+    boot = load_latest_gauge(appliance_id, "node_boot_time_seconds")
+    if boot is None:
+        return None
+    now = load_latest_gauge(appliance_id, "node_time_seconds")
+    if now is None:
+        now = time.time()
+    up = float(now) - float(boot)
+    return up if up >= 0 else None
 
 
 def prune_old_points(keep_days: int | None = None) -> int:

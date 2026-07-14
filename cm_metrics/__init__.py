@@ -348,7 +348,22 @@ def create_app() -> Flask:
 
     @app.post("/api/scrape")
     def api_scrape_all():
-        return jsonify({"results": scraper.scrape_all()})
+        # Manual Refresh passes force=1 so offline appliances are retried.
+        force = request.args.get("force", "0").lower() in {"1", "true", "yes"}
+        # Default async for force refresh so browser reload / tab switches do not
+        # cancel the server-side job. Pass async=0 for a blocking scrape.
+        async_mode = request.args.get("async", "1" if force else "0").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        if force and async_mode:
+            return jsonify(scraper.start_force_refresh())
+        return jsonify({"results": scraper.scrape_all(force=force)})
+
+    @app.get("/api/scrape/status")
+    def api_scrape_status():
+        return jsonify(scraper.force_refresh_status())
 
     @app.get("/api/health")
     def api_health():

@@ -18,6 +18,22 @@ export function fmtDuration(seconds) {
   return `${secs}s`;
 }
 
+/** Compact CM /v1/system/info uptime, e.g. "6 days, 13 hours, 53 minutes" → "6d 13h 53m". */
+export function formatCmUptime(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const compact = s
+    .replace(/,\s*/g, " ")
+    .replace(/\bdays?\b/gi, "d")
+    .replace(/\bhours?\b/gi, "h")
+    .replace(/\bminutes?\b/gi, "m")
+    .replace(/\bseconds?\b/gi, "s")
+    .replace(/\s+/g, " ")
+    .trim();
+  // "6 d 13 h 53 m" → "6d 13h 53m"
+  return compact.replace(/\s*([dhms])\b/gi, "$1").replace(/(\d[dhms])\s+/g, "$1 ");
+}
+
 export function isBytesUnit(unit) {
   return unit === "B" || unit === "bytes" || unit === "byte";
 }
@@ -172,6 +188,7 @@ export function appliancesSignature(list) {
       a.parent_appliance_id,
       a.cluster_role,
       a.sample_count,
+      a.cm_uptime || "",
     ])
   );
 }

@@ -243,26 +243,71 @@ form.addEventListener("submit", async (e) => {
   }
 });
 
+function setRefreshButtonBusy(busy) {
+  const { btnRefresh } = getDom();
+  if (!btnRefresh) return;
+  btnRefresh.disabled = busy;
+  btnRefresh.textContent = busy ? "Refreshing..." : "Refresh";
+  btnRefresh.classList.toggle("is-refreshing", busy);
+}
+
+let refreshPollTimer = null;
+
+async function pollForceRefreshUntilDone() {
+  setRefreshButtonBusy(true);
+  if (refreshPollTimer) {
+    clearInterval(refreshPollTimer);
+    refreshPollTimer = null;
+  }
+
+  const pollOnce = async () => {
+    try {
+      const st = await fetchJSON("/api/scrape/status");
+      await loadAppliances({ force: true }).catch(() => null);
+      if (state.viewMode === "appliances") {
+        await renderFleetHealth().catch(() => null);
+      } else if (state.viewMode === "dashboard" && state.applianceId) {
+        await loadDashboard(state.dashboardId, { forceFull: false }).catch(() => null);
+      }
+      await refreshStatus().catch(() => null);
+      if (!st?.running) {
+        if (refreshPollTimer) {
+          clearInterval(refreshPollTimer);
+          refreshPollTimer = null;
+        }
+        setRefreshButtonBusy(false);
+        // Final full paint so badges/uptime settle.
+        await tick({ forceFull: true, scrape: false }).catch(() => null);
+        return true;
+      }
+    } catch (err) {
+      console.warn("Refresh poll failed:", err);
+    }
+    return false;
+  };
+
+  const done = await pollOnce();
+  if (done) return;
+  refreshPollTimer = setInterval(() => {
+    void pollOnce();
+  }, 1500);
+}
+
 btnRefresh.addEventListener("click", async () => {
-  btnRefresh.disabled = true;
-  const prevLabel = btnRefresh.textContent;
-  btnRefresh.textContent = "Refreshing...";
   try {
     if (state.viewMode === "healthcheck") {
+      setRefreshButtonBusy(true);
       await refreshHealthcheckStatus();
+      setRefreshButtonBusy(false);
       return;
     }
-    if (state.applianceId) {
-      await fetchJSON(`/api/appliances/${state.applianceId}/scrape?force=1`, {
-        method: "POST",
-      }).catch(() => null);
-    } else {
-      await fetchJSON("/api/scrape", { method: "POST" }).catch(() => null);
-    }
-    await tick({ forceFull: true, scrape: false });
-  } finally {
-    btnRefresh.disabled = false;
-    btnRefresh.textContent = prevLabel || "Refresh";
+    // Fire-and-forget on the server — survives tab switches and browser reload.
+    await fetchJSON("/api/scrape?force=1", { method: "POST" });
+    await pollForceRefreshUntilDone();
+  } catch (err) {
+    console.warn("Refresh scrape failed:", err);
+    setRefreshButtonBusy(false);
+    await tick({ forceFull: true, scrape: false }).catch(() => null);
   }
 });
 
@@ -270,6 +315,19 @@ autoRefresh.addEventListener("change", schedule);
 
 showAppliancesTab();
 syncRangePicker();
-loadAppliances().then((list) => {
-  if (!list.length) openModal();
-}).then(() => tick({ forceFull: true, scrape: false })).then(schedule);
+loadAppliances()
+  .then((list) => {
+    if (!list.length) openModal();
+  })
+  .then(() => tick({ forceFull: true, scrape: false }))
+  .then(schedule)
+  .then(async () => {
+    // Resume Refresh UI if a server-side force scrape is still running after reload.
+    try {
+      const st = await fetchJSON("/api/scrape/status");
+      if (st?.running) await pollForceRefreshUntilDone();
+    } catch (_) {
+      /* ignore */
+    }
+  });
+

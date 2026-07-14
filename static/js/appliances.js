@@ -1,4 +1,4 @@
-import { escapeHtml, appliancesSignature, tsLabel } from "./format.js";
+import { escapeHtml, appliancesSignature, tsLabel, formatCmUptime } from "./format.js";
 import { fetchJSON, refreshStatus } from "./api.js";
 import { state, getDom } from "./state.js";
 import { cssVar } from "./theme.js";
@@ -159,6 +159,7 @@ export function applianceStatusBadge(a) {
   if (a.last_status === "ok") return { cls: "ok", text: "online" };
   if (a.last_status === "offline") return { cls: "offline", text: "offline" };
   if (a.last_status === "error") return { cls: "err", text: "error" };
+  if (a.last_status === "pending") return { cls: "", text: "retrying" };
   return { cls: "", text: a.last_status || "pending" };
 }
 
@@ -202,14 +203,17 @@ function treeNodeHtml(a, { nodeIndex = null, isPrimary = false, nested = false }
       : nested
         ? "member"
         : "";
+  const uptime =
+    a.last_status === "ok" ? formatCmUptime(a.cm_uptime) : "";
   return `
     <div class="tree-node${active}${offline ? " is-offline" : ""}" data-id="${a.id}" role="treeitem" aria-selected="${a.id === state.applianceId}">
-      <button type="button" class="tree-node-select" data-id="${a.id}" title="${escapeHtml(`${label} · ${shortHost}`)}">
+      <button type="button" class="tree-node-select" data-id="${a.id}" title="${escapeHtml(`${label} · ${shortHost}${uptime ? ` · up ${uptime}` : ""}`)}">
         <span class="tree-node-status ${badge.cls}" aria-hidden="true"></span>
         <span class="tree-node-body">
           <span class="tree-node-top">
             <span class="tree-node-name">${escapeHtml(label)}</span>
             ${role ? `<span class="tree-node-role">${role}</span>` : ""}
+            ${uptime ? `<span class="tree-node-uptime" title="Uptime">${escapeHtml(uptime)}</span>` : ""}
           </span>
           ${networkMetaHtml(a)}
         </span>

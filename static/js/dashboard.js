@@ -717,7 +717,7 @@ export async function tick({ forceFull = false, scrape = false } = {}) {
         method: "POST",
       }).catch(() => null);
     }
-    await loadAppliances();
+    await loadAppliances({ force: forceFull });
     await refreshStatus();
     if (state.viewMode === "dashboard") {
       // Auto: in-place value updates (no full DOM rebuild / flash).

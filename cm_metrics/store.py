@@ -39,18 +39,19 @@ class ApplianceStore:
         self._labels: dict[str, tuple[str, dict[str, str]]] = {}
         self._latest: Snapshot | None = None
         self._hydrated = False
+        self._series_hydrated = False
 
     def hydrate_from_db(self) -> None:
+        """Full hydrate (latest + series). Prefer hydrate_latest_only for scrapes."""
+        self.hydrate_latest_only()
+        self.ensure_series_hydrated()
+
+    def hydrate_latest_only(self) -> None:
+        """Fast path: latest scrape gauges only (no multi‑GB series history)."""
         if self._hydrated:
             return
-        since = time.time() - self.history_seconds
-        rows = db.load_series(self.appliance_id, since=since, limit=200_000)
         latest_rows = db.load_latest_samples(self.appliance_id, max_age_seconds=90.0)
         with self._lock:
-            for row in rows:
-                fp = row["fingerprint"]
-                self._series[fp].append((row["t"], row["v"]))
-                self._labels[fp] = (row["name"], row["labels"])
             if latest_rows:
                 samples = [
                     Sample(name=r["name"], labels=r["labels"], value=r["v"])
@@ -61,6 +62,34 @@ class ApplianceStore:
                     samples=samples,
                     source="db",
                 )
+                for r in latest_rows:
+                    self._labels[r["fingerprint"]] = (r["name"], r["labels"])
+            self._hydrated = True
+
+    def ensure_series_hydrated(self) -> None:
+        """Lazy-load time-series history when charts need it."""
+        if self._series_hydrated:
+            return
+        since = time.time() - self.history_seconds
+        rows = db.load_series(self.appliance_id, since=since, limit=200_000)
+        with self._lock:
+            by_fp: dict[str, list[tuple[float, float]]] = {}
+            labels: dict[str, tuple[str, dict[str, str]]] = {}
+            for row in rows:
+                fp = row["fingerprint"]
+                labels[fp] = (row["name"], row["labels"])
+                by_fp.setdefault(fp, []).append((row["t"], row["v"]))
+            for fp, pts in by_fp.items():
+                # Preserve any newer in-memory points from a live scrape.
+                existing = list(self._series.get(fp, ()))
+                existing_ts = {t for t, _ in existing}
+                merged_pts = [(t, v) for t, v in pts if t not in existing_ts] + existing
+                merged_pts.sort(key=lambda x: x[0])
+                dq = self._series[fp]
+                dq.clear()
+                dq.extend(merged_pts)
+                self._labels[fp] = labels[fp]
+            self._series_hydrated = True
             self._hydrated = True
 
     def ingest(
@@ -82,18 +111,36 @@ class ApplianceStore:
                 while self._series[fp] and self._series[fp][0][0] < cutoff:
                     self._series[fp].popleft()
                 persist_rows.append((fp, sample.name, sample.labels, now, sample.value))
-            if persist and persist_rows and source in {"live", "demo"}:
-                # Persist all scraped samples except noisy/internal prefixes.
-                # Live dashboards already use the full in-memory scrape.
-                skip_prefixes = ("dummy_",)
-                skip_suffixes = ("_bucket",)  # histogram buckets explode cardinality
-                to_store = [
-                    r
-                    for r in persist_rows
-                    if not r[1].startswith(skip_prefixes)
-                    and not r[1].endswith(skip_suffixes)
-                ]
-                db.insert_metric_points(self.appliance_id, to_store)
+            self._pending_persist = (source, persist_rows)
+            if persist:
+                self._persist_rows_unlocked(source, persist_rows)
+
+    def persist_last_ingest(self) -> None:
+        """Flush rows from the last ingest(persist=False) to SQLite."""
+        with self._lock:
+            pending = getattr(self, "_pending_persist", None)
+            if not pending:
+                return
+            source, persist_rows = pending
+            self._pending_persist = None
+            self._persist_rows_unlocked(source, persist_rows)
+
+    def _persist_rows_unlocked(
+        self,
+        source: str,
+        persist_rows: list[tuple[str, str, dict[str, str], float, float]],
+    ) -> None:
+        if not persist_rows or source not in {"live", "demo"}:
+            return
+        skip_prefixes = ("dummy_",)
+        skip_suffixes = ("_bucket",)  # histogram buckets explode cardinality
+        to_store = [
+            r
+            for r in persist_rows
+            if not r[1].startswith(skip_prefixes) and not r[1].endswith(skip_suffixes)
+        ]
+        if to_store:
+            db.insert_metric_points(self.appliance_id, to_store)
 
     def record_gauge(
         self,
@@ -146,6 +193,7 @@ class ApplianceStore:
         since: float | None = None,
         limit_series: int = 20,
     ) -> list[dict[str, Any]]:
+        self.ensure_series_hydrated()
         with self._lock:
             results: list[dict[str, Any]] = []
             # Prefer matching against known fingerprints
@@ -192,6 +240,17 @@ class ApplianceStore:
 
     def gauge_value(self, name: str, labels: dict[str, str] | None = None) -> float | None:
         return first_value(self.latest_samples(), name, labels)
+
+    def uptime_seconds(self) -> float | None:
+        """Host uptime from node_time_seconds − node_boot_time_seconds, if available."""
+        now = self.gauge_value("node_time_seconds")
+        boot = self.gauge_value("node_boot_time_seconds")
+        if now is None:
+            now = time.time()
+        if boot is None:
+            return None
+        up = float(now) - float(boot)
+        return up if up >= 0 else None
 
     def sum_value(self, name: str, labels: dict[str, str] | None = None) -> float:
         return sum_samples(self.latest_samples(), name, labels)
@@ -255,14 +314,17 @@ class MetricsStore:
         self._lock = threading.RLock()
         self._stores: dict[int, ApplianceStore] = {}
 
-    def for_appliance(self, appliance_id: int) -> ApplianceStore:
+    def for_appliance(self, appliance_id: int, *, hydrate: bool = True) -> ApplianceStore:
         with self._lock:
             store = self._stores.get(appliance_id)
             if store is None:
                 store = ApplianceStore(appliance_id, self.history_seconds)
-                store.hydrate_from_db()
                 self._stores[appliance_id] = store
-            return store
+        # Hydrate outside the registry lock. Scrapes pass hydrate=False so a
+        # multi‑GB SQLite read cannot block status updates for minutes.
+        if hydrate:
+            store.hydrate_latest_only()
+        return store
 
     def drop(self, appliance_id: int) -> None:
         with self._lock:

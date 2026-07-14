@@ -863,6 +863,14 @@ code {
   flex-shrink: 0;
 }
 
+.tree-node-uptime {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--muted);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .tree-node-host {
   font-size: 12px;
   color: var(--muted);

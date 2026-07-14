@@ -76,6 +76,7 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
     cm_name = (appliance or {}).get("cm_name") or None
     cm_version = (appliance or {}).get("cm_version") or None
     cm_model = (appliance or {}).get("cm_model") or None
+    cm_uptime = ((appliance or {}).get("cm_uptime") or "").strip() or None
     display_name = None
     host = None
     if appliance:
@@ -114,6 +115,13 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
         if v is not None
     ]
 
+    # Prefer CM /v1/system/info uptime string; fall back to Prometheus host uptime.
+    uptime_panel = (
+        _stat("Uptime", cm_uptime)
+        if cm_uptime
+        else _stat("Uptime", uptime, "duration")
+    )
+
     panels: list[dict[str, Any]] = [
         _stat("Name", display_name),
         _stat("CM Hostname", cm_name or host),
@@ -127,7 +135,7 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
         _stat("CPU Utilization", cpu_use, "%"),
         _stat("Memory Utilization", mem_use, "%"),
         _stat("Disk Utilization", disk_use, "%"),
-        _stat("Uptime", uptime, "duration"),
+        uptime_panel,
         _bar("Host Utilization", util_bar, "%", "Current CPU / memory / disk usage"),
         _bar(
             "Top 5 Users by Logins",

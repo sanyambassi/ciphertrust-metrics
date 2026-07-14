@@ -46,6 +46,27 @@ def _is_auto_node_name(name: str) -> bool:
     return False
 
 
+def _tcp_reachable(host: str, *, timeout: float = 3.0) -> bool:
+    """Fast TCP reachability check (avoids multi-minute blackhole hangs)."""
+    import socket
+
+    raw = (host or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    port = parsed.port or (443 if (parsed.scheme or "https") == "https" else 80)
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 # Reuse a compact demo template for optional offline testing
 from .scraper_demo import DemoGenerator  # noqa: E402
 
@@ -60,6 +81,18 @@ class MetricsScraper:
         self._lock = threading.RLock()
         # Serialize scrapes per appliance so UI Refresh + background loop never overlap.
         self._scrape_locks: dict[int, threading.Lock] = {}
+        # Manual Refresh job (survives browser reload / tab switches).
+        self._force_lock = threading.Lock()
+        self._force_thread: threading.Thread | None = None
+        self._force_status: dict[str, Any] = {
+            "running": False,
+            "started_at": None,
+            "finished_at": None,
+            "ok": 0,
+            "failed": 0,
+            "total": 0,
+            "error": None,
+        }
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -72,6 +105,70 @@ class MetricsScraper:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+
+    def force_refresh_status(self) -> dict[str, Any]:
+        """Snapshot of the in-flight / last manual Refresh job."""
+        with self._force_lock:
+            return dict(self._force_status)
+
+    def start_force_refresh(self) -> dict[str, Any]:
+        """Kick off a fleet force-scrape on a daemon thread; return immediately.
+
+        Safe across browser reloads — work lives in the server process.
+        If a force refresh is already running, returns the current status.
+        """
+        with self._force_lock:
+            if self._force_thread and self._force_thread.is_alive():
+                return {"accepted": False, "already_running": True, **dict(self._force_status)}
+            self._force_status = {
+                "running": True,
+                "started_at": time.time(),
+                "finished_at": None,
+                "ok": 0,
+                "failed": 0,
+                "total": 0,
+                "error": None,
+            }
+            self._force_thread = threading.Thread(
+                target=self._run_force_refresh,
+                name="cm-force-refresh",
+                daemon=True,
+            )
+            self._force_thread.start()
+            return {"accepted": True, "already_running": False, **dict(self._force_status)}
+
+    def _run_force_refresh(self) -> None:
+        try:
+            results = self.scrape_all(force=True)
+            ok = sum(1 for r in results if r.get("ok"))
+            failed = sum(1 for r in results if not r.get("ok") and not r.get("skipped"))
+            with self._force_lock:
+                self._force_status.update(
+                    {
+                        "running": False,
+                        "finished_at": time.time(),
+                        "ok": ok,
+                        "failed": failed,
+                        "total": len(results),
+                        "error": None,
+                    }
+                )
+            logger.info(
+                "Force refresh finished: %s ok, %s failed, %s total",
+                ok,
+                failed,
+                len(results),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Force refresh crashed")
+            with self._force_lock:
+                self._force_status.update(
+                    {
+                        "running": False,
+                        "finished_at": time.time(),
+                        "error": str(exc),
+                    }
+                )
 
     def _get_client(self, appliance: dict[str, Any]) -> CMClient:
         aid = int(appliance["id"])
@@ -342,7 +439,9 @@ class MetricsScraper:
 
         return added
 
-    def _scrape_with_metrics_token(self, appliance: dict[str, Any]) -> list[Any]:
+    def _scrape_with_metrics_token(
+        self, appliance: dict[str, Any], *, timeout: float | None = None
+    ) -> list[Any]:
         """Scrape using stored Prometheus token only (no password/JWT needed)."""
         token = appliance.get("metrics_token")
         if not token:
@@ -351,6 +450,7 @@ class MetricsScraper:
             host=appliance["host"],
             username=appliance.get("username") or "metrics",
             password="",
+            timeout=timeout or 30.0,
         )
         client.metrics_token = token
         return client.scrape_metrics(token)
@@ -382,7 +482,7 @@ class MetricsScraper:
     ) -> None:
         needs_info = not appliance.get("cm_version")
         last_info = float(appliance.get("system_info_at") or 0)
-        if force or needs_info or (time.time() - last_info) > 3600:
+        if force or needs_info or (time.time() - last_info) > 900:
             info = client.system_info()
             if info:
                 db.update_appliance_system_info(appliance_id, info)
@@ -458,9 +558,15 @@ class MetricsScraper:
     def scrape_appliance(self, appliance_id: int, *, force: bool = False) -> dict[str, Any]:
         lock = self._appliance_scrape_lock(appliance_id)
         # Non-forced (background) scrapes skip if a scrape is already running.
-        # Forced (manual Refresh) waits for the in-flight scrape, then runs again.
+        # Forced (manual Refresh) waits briefly for the in-flight scrape, then runs.
         if force:
-            lock.acquire()
+            if not lock.acquire(timeout=45.0):
+                return {
+                    "ok": False,
+                    "skipped": True,
+                    "error": "timed out waiting for in-flight scrape",
+                    "appliance_id": appliance_id,
+                }
         elif not lock.acquire(blocking=False):
             return {
                 "ok": False,
@@ -500,15 +606,53 @@ class MetricsScraper:
                 "appliance_id": appliance_id,
                 "fail_count": int(appliance.get("fail_count") or 0),
             }
+        # Capture before reset — used to apply a short connect budget only for retries.
+        was_unreachable = (appliance.get("last_status") or "") in {
+            "offline",
+            "pending",
+            "error",
+        } or db.is_appliance_offline(appliance)
         if force:
             db.reset_appliance_failures(appliance_id)
+
+        # Fast-fail blackholed / firewalled hosts before HTTP (which can hang far
+        # longer than requests' timeout on some kernels when SYNs are dropped).
+        host_up = True
+        if force and was_unreachable:
+            host_up = _tcp_reachable(str(appliance.get("host") or ""), timeout=3.0)
+            if not host_up:
+                err = f"TCP unreachable: {appliance.get('host')}"
+                logger.warning("Scrape probe failed for appliance %s: %s", appliance_id, err)
+                self.invalidate_client(appliance_id)
+                try:
+                    db.update_appliance_scrape(
+                        appliance_id,
+                        ok=False,
+                        sample_count=0,
+                        error=err,
+                        source="error",
+                        mark_offline=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Could not persist probe failure for appliance %s",
+                        appliance_id,
+                        exc_info=True,
+                    )
+                return {"ok": False, "source": "error", "error": err, "appliance_id": appliance_id}
 
         try:
             samples: list[Any]
             if decrypt_error:
-                samples = self._scrape_with_metrics_token(appliance)
+                samples = self._scrape_with_metrics_token(
+                    appliance,
+                    timeout=10.0 if (force and was_unreachable and not host_up) else 30.0,
+                )
             else:
                 client = self._get_client(appliance)
+                # Unreachable (TCP down) already returned above. Reachable hosts —
+                # even ones previously marked offline — get a normal timeout.
+                client.set_timeout(30.0)
                 # Refresh JWT periodically
                 if not client.jwt or time.time() >= client.jwt_expires_at:
                     client.login()
@@ -526,7 +670,10 @@ class MetricsScraper:
                     db.update_appliance_auth(appliance_id, metrics_token=token)
                 samples = client.scrape_metrics(token)
 
-            self.store.for_appliance(appliance_id).ingest(samples, source="live")
+            store = self.store.for_appliance(appliance_id, hydrate=False)
+            store.ingest(samples, source="live", persist=False)
+            # Persist status BEFORE the heavy metric insert so Refresh/UI is not
+            # blocked for minutes behind SQLite writes on large history DBs.
             try:
                 db.update_appliance_scrape(
                     appliance_id, ok=True, sample_count=len(samples), source="live"
@@ -534,6 +681,14 @@ class MetricsScraper:
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "Could not persist scrape success for appliance %s (DB busy)",
+                    appliance_id,
+                    exc_info=True,
+                )
+            try:
+                store.persist_last_ingest()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Could not persist metric points for appliance %s (DB busy)",
                     appliance_id,
                     exc_info=True,
                 )
@@ -619,7 +774,9 @@ class MetricsScraper:
             self.invalidate_client(appliance_id)
             if Config.DEMO_MODE:
                 samples = parse_prometheus_text(self._demo.tick())
-                self.store.for_appliance(appliance_id).ingest(samples, source="demo", error=str(exc))
+                self.store.for_appliance(appliance_id, hydrate=False).ingest(
+                    samples, source="demo", error=str(exc)
+                )
                 db.update_appliance_scrape(
                     appliance_id, ok=False, sample_count=len(samples), error=str(exc), source="demo"
                 )
@@ -630,10 +787,19 @@ class MetricsScraper:
                     "count": len(samples),
                     "appliance_id": appliance_id,
                 }
-            self.store.for_appliance(appliance_id).ingest([], source="error", error=str(exc))
+            self.store.for_appliance(appliance_id, hydrate=False).ingest(
+                [], source="error", error=str(exc)
+            )
             try:
+                # Force-retry of a previously unreachable host: one hard fail → offline
+                # so the background loop stops hammering it and blocking Refresh.
                 db.update_appliance_scrape(
-                    appliance_id, ok=False, sample_count=0, error=str(exc), source="error"
+                    appliance_id,
+                    ok=False,
+                    sample_count=0,
+                    error=str(exc),
+                    source="error",
+                    mark_offline=bool(force and was_unreachable),
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -643,26 +809,45 @@ class MetricsScraper:
                 )
             return {"ok": False, "source": "error", "error": str(exc), "appliance_id": appliance_id}
 
-    def scrape_all(self) -> list[dict[str, Any]]:
-        results = []
-        for appliance in db.list_appliances():
-            if not appliance.get("enabled"):
-                continue
-            if db.is_appliance_offline(appliance):
-                db.ensure_offline_status(int(appliance["id"]))
-                results.append(
-                    {
-                        "ok": False,
-                        "skipped": True,
-                        "error": "offline",
-                        "appliance_id": int(appliance["id"]),
-                        "fail_count": int(appliance.get("fail_count") or 0),
-                    }
-                )
-                continue
-            results.append(self.scrape_appliance(int(appliance["id"])))
-            # Small stagger between appliances to avoid thundering-herd on CM/SQLite.
-            time.sleep(0.5)
+    def scrape_all(self, *, force: bool = False) -> list[dict[str, Any]]:
+        """Scrape every enabled appliance.
+
+        Background loop uses force=False and skips known-offline hosts.
+        Manual Refresh uses force=True so offline appliances are retried in parallel.
+        """
+        enabled = [a for a in db.list_appliances() if a.get("enabled")]
+        results: list[dict[str, Any]] = []
+
+        if not force:
+            for appliance in enabled:
+                status = (appliance.get("last_status") or "").lower()
+                # Background loop only keeps healthy hosts fresh. Offline/error/
+                # pending are retried on manual Refresh (force=True) so a sick
+                # peer cannot hold scrape locks / DB writers for minutes.
+                if status in {"offline", "error", "pending"} or db.is_appliance_offline(appliance):
+                    if status != "offline" and db.is_appliance_offline(appliance):
+                        db.ensure_offline_status(int(appliance["id"]))
+                    results.append(
+                        {
+                            "ok": False,
+                            "skipped": True,
+                            "error": status or "offline",
+                            "appliance_id": int(appliance["id"]),
+                            "fail_count": int(appliance.get("fail_count") or 0),
+                        }
+                    )
+                    continue
+                results.append(self.scrape_appliance(int(appliance["id"]), force=False))
+                # Small stagger between appliances to avoid thundering-herd on CM/SQLite.
+                time.sleep(0.5)
+        else:
+            # Force: scrape sequentially, but previously-unreachable hosts are
+            # TCP-probed and fail in a few seconds so they cannot block the fleet.
+            # (Parallel force scrapes contended on the large SQLite DB and hung.)
+            for appliance in enabled:
+                results.append(self.scrape_appliance(int(appliance["id"]), force=True))
+                time.sleep(0.15)
+
         if not results and Config.DEMO_MODE:
             # Seed a demo appliance so UI is usable offline
             demo = db.create_or_update_appliance(
@@ -677,13 +862,19 @@ class MetricsScraper:
             results.append({"ok": True, "source": "demo", "count": len(samples), "appliance_id": demo["id"]})
         # Fleet online/offline history for the Appliances tab chart.
         try:
-            db.record_fleet_health_sample()
+            db.record_fleet_health_sample(force=force)
         except Exception:  # noqa: BLE001
             logger.debug("fleet health sample failed", exc_info=True)
         return results
 
     def _loop(self) -> None:
         db.init_db()
+        try:
+            n = db.recover_stuck_pending(max_age_seconds=30.0)
+            if n:
+                logger.info("Cleared %s stuck pending appliance status(es) on startup", n)
+        except Exception:  # noqa: BLE001
+            logger.debug("recover_stuck_pending failed", exc_info=True)
         # quick initial pass
         try:
             self.scrape_all()
@@ -691,6 +882,10 @@ class MetricsScraper:
             logger.exception("Initial scrape failed")
         while not self._stop.wait(Config.SCRAPE_INTERVAL):
             try:
+                try:
+                    db.recover_stuck_pending(max_age_seconds=180.0)
+                except Exception:  # noqa: BLE001
+                    pass
                 self.scrape_all()
                 if random.random() < 0.05:
                     db.prune_old_points()

@@ -9,11 +9,33 @@ from urllib.parse import urlparse
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .parser import Sample, parse_prometheus_text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
+
+
+def _session_no_retries() -> requests.Session:
+    """Session that fails fast — no urllib3 connect/read retries."""
+    session = requests.Session()
+    session.verify = False
+    retry = Retry(
+        total=0,
+        connect=0,
+        read=0,
+        redirect=0,
+        status=0,
+        other=0,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+    return session
 
 
 class CMClientError(Exception):
@@ -26,19 +48,30 @@ class CMClientError(Exception):
 class CMClient:
     """Talk to a CipherTrust Manager appliance. SSL verification is always disabled."""
 
-    def __init__(self, host: str, username: str, password: str, domain: str = "") -> None:
+    def __init__(
+        self,
+        host: str,
+        username: str,
+        password: str,
+        domain: str = "",
+        *,
+        timeout: float = 30.0,
+    ) -> None:
         self.host = host.rstrip("/")
         if "://" not in self.host:
             self.host = f"https://{self.host}"
         self.username = username
         self.password = password
         self.domain = domain or ""
+        self.timeout = float(timeout)
         self.jwt: str | None = None
         self.jwt_expires_at: float = 0.0
         self.metrics_token: str | None = None
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+        self.session = _session_no_retries()
+
+    def set_timeout(self, timeout: float) -> None:
+        """Tighten/loosen HTTP timeouts (e.g. shorter on manual Refresh retries)."""
+        self.timeout = max(3.0, float(timeout))
 
     @property
     def base(self) -> str:
@@ -48,7 +81,7 @@ class CMClient:
         body: dict[str, Any] = {"name": self.username, "password": self.password}
         if self.domain:
             body["domain"] = self.domain
-        resp = self.session.post(f"{self.base}/auth/tokens/", json=body, timeout=30)
+        resp = self.session.post(f"{self.base}/auth/tokens/", json=body, timeout=self.timeout)
         if resp.status_code >= 400:
             raise CMClientError(
                 f"Login failed ({resp.status_code}): {resp.text[:300]}",
@@ -76,10 +109,10 @@ class CMClient:
 
     def get_json(self, path: str, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.base}{path}"
-        resp = self.session.get(url, headers=self._auth_headers(), timeout=30, **kwargs)
+        resp = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout, **kwargs)
         if resp.status_code == 401:
             self.login()
-            resp = self.session.get(url, headers=self._auth_headers(), timeout=30, **kwargs)
+            resp = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout, **kwargs)
         if resp.status_code >= 400:
             raise CMClientError(
                 f"GET {path} failed ({resp.status_code}): {resp.text[:300]}",
@@ -92,10 +125,10 @@ class CMClient:
 
     def post_json(self, path: str, body: dict | None = None, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.base}{path}"
-        resp = self.session.post(url, headers=self._auth_headers(), json=body or {}, timeout=30, **kwargs)
+        resp = self.session.post(url, headers=self._auth_headers(), json=body or {}, timeout=self.timeout, **kwargs)
         if resp.status_code == 401:
             self.login()
-            resp = self.session.post(url, headers=self._auth_headers(), json=body or {}, timeout=30, **kwargs)
+            resp = self.session.post(url, headers=self._auth_headers(), json=body or {}, timeout=self.timeout, **kwargs)
         if resp.status_code >= 400:
             raise CMClientError(
                 f"POST {path} failed ({resp.status_code}): {resp.text[:300]}",
@@ -596,10 +629,13 @@ class CMClient:
     def scrape_metrics(self, metrics_token: str | None = None) -> list[Sample]:
         token = metrics_token or self.metrics_token or self.ensure_metrics_token()
         url = f"{self.base}/system/metrics/prometheus"
+        # Keep a longer read budget for large Prometheus dumps unless caller
+        # tightened timeout (manual Refresh of possibly-dead hosts).
+        scrape_timeout = self.timeout if self.timeout < 30 else max(self.timeout, 60.0)
         resp = self.session.get(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": "text/plain"},
-            timeout=60,
+            timeout=scrape_timeout,
         )
         if resp.status_code >= 400:
             # Token may have been rotated — refresh once
@@ -607,7 +643,7 @@ class CMClient:
             resp = self.session.get(
                 url,
                 headers={"Authorization": f"Bearer {token}", "Accept": "text/plain"},
-                timeout=60,
+                timeout=scrape_timeout,
             )
         if resp.status_code >= 400:
             raise CMClientError(
