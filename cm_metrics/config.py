@@ -43,6 +43,10 @@ def _ensure_secret() -> str:
 class Config:
     SECRET_KEY: str = _ensure_secret()
     DATABASE_PATH: Path = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "cm_metrics.db")))
+    # Per-appliance metric SQLite files live here (metric_points + scrape_runs).
+    METRICS_DIR: Path = Path(
+        os.getenv("METRICS_DIR", str(DATABASE_PATH.parent / "metrics"))
+    )
     # TLS verification is always disabled per product requirement for CM connections.
     CM_VERIFY_TLS: bool = False
     SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL", "60"))

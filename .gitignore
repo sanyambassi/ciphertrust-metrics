@@ -8,7 +8,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# Secrets & local runtime state — never commit
+# Secrets & local runtime state
 .env
 .env.*
 !.env.example
@@ -20,12 +20,15 @@ data/
 *.pem
 *.key
 
-# Local deploy / scratch scripts (may contain host credentials)
-# Do not use _*.py — that also matches __init__.py
+# Local deploy / scratch scripts
 _deploy*.py
 _redeploy*.py
 _push*.py
 _tmp*
+_*.txt
+_*.sh
+_*.json
+_res_out*
 _*.txt
 _*.sh
 _*.json
@@ -40,7 +43,7 @@ _res_out*
 .DS_Store
 Thumbs.db
 
-# CipherTrust CLI binaries (large; Docker image bundles Linux ksctl)
+# CipherTrust CLI binaries
 tools/ksctl
 tools/ksctl.exe
 tools/ksctl-linux-amd64

@@ -120,7 +120,7 @@ def create_app() -> Flask:
 
     @app.delete("/api/appliances/<int:appliance_id>")
     def api_delete_appliance(appliance_id: int):
-        """Remove appliance immediately from the UI; purge history in the background."""
+        """Remove appliance and its metrics history immediately."""
         meta = db.begin_appliance_delete(appliance_id)
         if not meta:
             return jsonify({"error": "not found"}), 404
@@ -135,11 +135,11 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "ok": True,
-                "async": True,
+                "async": False,
                 "already_deleting": bool(meta.get("already_deleting") or job.get("already_running")),
                 "appliance_id": appliance_id,
                 "message": (
-                    f'Removed "{label}" from the list. Metric history is being deleted in the background.'
+                    f'Removed "{label}" and its metric history.'
                 ),
             }
         )

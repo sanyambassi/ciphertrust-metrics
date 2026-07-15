@@ -284,7 +284,7 @@ function menuItemHtml(a, { nested = false, nodeIndex = null, isPrimary = false }
     isPrimary || a.cluster_role === "primary"
       ? "primary"
       : nested
-        ? "node"
+        ? "member"
         : "";
   return `
     <button type="button" class="appliance-menu-item${active}${nested ? " nested" : ""}" data-id="${a.id}" role="option" aria-selected="${a.id === state.applianceId}">
@@ -832,7 +832,7 @@ export async function handleApplianceAction(e) {
     const appliance = state.appliances.find((a) => a.id === id);
     const name = appliance?.display_name || appliance?.host || `#${id}`;
     if (!window.confirm(
-      `Remove appliance "${name}"?\n\nIt disappears from the list immediately. Metric history is deleted in the background (may take several minutes on large databases).`
+      `Remove appliance "${name}"?\n\nThis removes it from the list and deletes its metric history immediately.`
     )) {
       return true;
     }
@@ -860,11 +860,10 @@ export async function handleApplianceAction(e) {
         await loadDashboard(state.dashboardId, { forceFull: true });
       }
       await refreshStatus();
-      showToast(res?.message || `Removed "${name}". History purge continues in the background.`, {
+      showToast(res?.message || `Removed "${name}" and its metric history.`, {
         type: "ok",
-        duration: 5200,
+        duration: 4200,
       });
-      // Keep watching for a background-delete failure notification.
       void pollDeleteNotifications();
     } catch (err) {
       window.alert(err.message || "Failed to remove appliance");

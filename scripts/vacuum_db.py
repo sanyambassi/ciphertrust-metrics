@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Manual SQLite VACUUM for CipherTrust Metrics.
 
-Reclaims free space after large deletes. This is rare maintenance — the live
-scrape loop already runs ``PRAGMA optimize`` after prune.
+Reclaims free space after large deletes across the catalog DB and every
+per-appliance metrics file under ``data/metrics/``. This is rare maintenance —
+the live scrape loop already runs ``PRAGMA optimize`` after prune.
 
 Usage (from the install root, with the same env/DB path as the service):
 
@@ -11,7 +12,7 @@ Usage (from the install root, with the same env/DB path as the service):
     sudo /opt/cm-metrics/venv/bin/python /opt/cm-metrics/scripts/vacuum_db.py
     sudo systemctl start cm-metrics
 
-Needs roughly as much free disk as the current DB size while rewriting.
+Needs roughly as much free disk as the largest file being rewritten.
 """
 from __future__ import annotations
 
@@ -42,25 +43,31 @@ def _free_bytes(path: Path) -> int | None:
 
 
 def main() -> int:
-    path = Config.DATABASE_PATH
-    if not path.exists():
-        print(f"Database not found: {path}", file=sys.stderr)
+    catalog = Config.DATABASE_PATH
+    if not catalog.exists():
+        print(f"Catalog database not found: {catalog}", file=sys.stderr)
         return 1
 
-    size = path.stat().st_size
-    free = _free_bytes(path.parent)
-    print(f"DB: {path}")
-    print(f"Size: {size / 1024**3:.2f} GiB")
+    db.init_db()
+    paths = [catalog, *db.list_metrics_db_paths()]
+    total = sum(p.stat().st_size for p in paths if p.exists())
+    largest = max((p.stat().st_size for p in paths if p.exists()), default=0)
+    free = _free_bytes(catalog.parent)
+
+    print(f"Catalog: {catalog}")
+    print(f"Metrics dir: {db.metrics_dir()}")
+    print(f"Files: {len(paths)} (catalog + {len(paths) - 1} metrics)")
+    print(f"Total size: {total / 1024**3:.2f} GiB")
     if free is not None:
         print(f"Free disk: {free / 1024**3:.2f} GiB")
-        if free < size * 1.05:
+        if free < largest * 1.05:
             print(
-                "Refusing VACUUM: need about as much free disk as the DB size.",
+                "Refusing VACUUM: need about as much free disk as the largest DB file.",
                 file=sys.stderr,
             )
             return 2
 
-    print("Running VACUUM (this can take a while on multi‑GB files)...")
+    print("Running VACUUM on catalog + metrics DBs...")
     result = db.vacuum_db()
     before = result["before_bytes"] / 1024**3
     after = result["after_bytes"] / 1024**3

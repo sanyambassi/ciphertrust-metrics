@@ -1,4 +1,11 @@
-"""SQLite persistence for appliances and metric history."""
+"""SQLite persistence for appliances and metric history.
+
+Catalog DB (``Config.DATABASE_PATH``): appliances, cluster_peers, fleet_health,
+healthcheck_runs, notifications.
+
+Per-appliance metrics DBs (``metrics_dir() / appliance_{id}.db``): metric_points,
+scrape_runs. Deleting an appliance unlinks its metrics file instead of row-wiping.
+"""
 
 from __future__ import annotations
 
@@ -15,12 +22,100 @@ from .security import decrypt_text, encrypt_text
 
 _lock = threading.RLock()
 _initialized = False
+_metrics_locks_guard = threading.Lock()
+_metrics_locks: dict[int, threading.RLock] = {}
+
+_METRICS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS metric_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    appliance_id INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    labels_json TEXT NOT NULL,
+    ts REAL NOT NULL,
+    value REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metric_points_lookup ON metric_points(fingerprint, ts);
+CREATE INDEX IF NOT EXISTS idx_metric_points_name ON metric_points(metric_name, ts);
+CREATE INDEX IF NOT EXISTS idx_metric_points_ts ON metric_points(ts);
+
+CREATE TABLE IF NOT EXISTS scrape_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    appliance_id INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    finished_at REAL,
+    ok INTEGER,
+    source TEXT,
+    sample_count INTEGER DEFAULT 0,
+    error TEXT
+);
+"""
 
 
 def db_path() -> Path:
     path = Config.DATABASE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def metrics_dir() -> Path:
+    path = Config.METRICS_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def metrics_db_path(appliance_id: int) -> Path:
+    return metrics_dir() / f"appliance_{int(appliance_id)}.db"
+
+
+def list_metrics_db_paths() -> list[Path]:
+    """Return existing ``appliance_*.db`` files under the metrics directory."""
+    root = metrics_dir()
+    return sorted(root.glob("appliance_*.db"))
+
+
+def _metrics_lock_for(appliance_id: int) -> threading.RLock:
+    aid = int(appliance_id)
+    with _metrics_locks_guard:
+        lock = _metrics_locks.get(aid)
+        if lock is None:
+            lock = threading.RLock()
+            _metrics_locks[aid] = lock
+        return lock
+
+
+def ensure_metrics_db(appliance_id: int) -> Path:
+    """Create the per-appliance metrics SQLite file + schema if missing."""
+    path = metrics_db_path(appliance_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=30.0, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 60000")
+        conn.executescript(_METRICS_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def drop_metrics_db(appliance_id: int) -> None:
+    """Unlink the appliance metrics DB and WAL/SHM sidecars."""
+    aid = int(appliance_id)
+    path = metrics_db_path(aid)
+    for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            # Retry once after a brief pause (file may still be closing).
+            time.sleep(0.05)
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+    with _metrics_locks_guard:
+        _metrics_locks.pop(aid, None)
 
 
 @contextmanager
@@ -53,11 +148,57 @@ def connect_read(*, timeout: float = 15.0) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _retry_locked(fn, *, attempts: int = 12, delay: float = 0.2):
-    """Retry a DB write when SQLite reports database is locked.
+@contextmanager
+def connect_metrics(appliance_id: int, *, timeout: float = 60.0) -> Iterator[sqlite3.Connection]:
+    """Write connection to a per-appliance metrics DB (WAL + busy_timeout)."""
+    ensure_metrics_db(appliance_id)
+    conn = sqlite3.connect(
+        str(metrics_db_path(appliance_id)),
+        timeout=timeout,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    Serializes writers via the module lock so Flask requests and the scrape
-    loop do not stampede the same SQLite file.
+
+@contextmanager
+def connect_metrics_read(appliance_id: int, *, timeout: float = 15.0) -> Iterator[sqlite3.Connection]:
+    """Read connection to a per-appliance metrics DB (no commit)."""
+    path = metrics_db_path(appliance_id)
+    if not path.exists():
+        # Empty in-memory stand-in so callers can SELECT without special-casing.
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(_METRICS_SCHEMA)
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+    conn = sqlite3.connect(str(path), timeout=timeout, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _retry_locked(fn, *, attempts: int = 12, delay: float = 0.2):
+    """Retry a catalog DB write when SQLite reports database is locked.
+
+    Serializes catalog writers via the module lock so Flask requests and the
+    scrape loop do not stampede the same SQLite file.
     """
     last: Exception | None = None
     for i in range(attempts):
@@ -74,11 +215,30 @@ def _retry_locked(fn, *, attempts: int = 12, delay: float = 0.2):
     raise last
 
 
+def _retry_metrics_locked(appliance_id: int, fn, *, attempts: int = 12, delay: float = 0.2):
+    """Retry a per-appliance metrics write under that appliance's lock only."""
+    lock = _metrics_lock_for(appliance_id)
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            with lock:
+                return fn()
+        except sqlite3.OperationalError as exc:
+            last = exc
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            time.sleep(delay * (i + 1))
+    assert last is not None
+    raise last
+
+
 def init_db() -> None:
     global _initialized
     with _lock:
         if _initialized:
             return
+        metrics_dir()
         with connect() as conn:
             conn.executescript(
                 """
@@ -115,36 +275,6 @@ def init_db() -> None:
                     source TEXT,
                     discovered_at REAL NOT NULL,
                     UNIQUE(appliance_id, peer_host),
-                    FOREIGN KEY(appliance_id) REFERENCES appliances(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS metric_points (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    appliance_id INTEGER NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    metric_name TEXT NOT NULL,
-                    labels_json TEXT NOT NULL,
-                    ts REAL NOT NULL,
-                    value REAL NOT NULL,
-                    FOREIGN KEY(appliance_id) REFERENCES appliances(id) ON DELETE CASCADE
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_metric_points_lookup
-                    ON metric_points(appliance_id, fingerprint, ts);
-                CREATE INDEX IF NOT EXISTS idx_metric_points_name
-                    ON metric_points(appliance_id, metric_name, ts);
-                CREATE INDEX IF NOT EXISTS idx_metric_points_ts
-                    ON metric_points(ts);
-
-                CREATE TABLE IF NOT EXISTS scrape_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    appliance_id INTEGER NOT NULL,
-                    started_at REAL NOT NULL,
-                    finished_at REAL,
-                    ok INTEGER,
-                    source TEXT,
-                    sample_count INTEGER DEFAULT 0,
-                    error TEXT,
                     FOREIGN KEY(appliance_id) REFERENCES appliances(id) ON DELETE CASCADE
                 );
 
@@ -231,15 +361,6 @@ def init_db() -> None:
                     appliance_id INTEGER,
                     created_at REAL NOT NULL,
                     dismissed_at REAL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS metric_purge_queue (
-                    appliance_id INTEGER PRIMARY KEY,
-                    label TEXT,
-                    created_at REAL NOT NULL
                 )
                 """
             )
@@ -466,6 +587,7 @@ def create_or_update_appliance(
                 ),
             )
             appliance_id = int(cur.lastrowid)
+    ensure_metrics_db(appliance_id)
     return get_appliance(appliance_id)  # type: ignore[return-value]
 
 
@@ -613,7 +735,7 @@ def update_appliance_scrape(
     init_db()
     now = time.time()
 
-    def _do() -> None:
+    def _do_catalog() -> tuple[int, str | None]:
         with connect() as conn:
             row = conn.execute(
                 "SELECT fail_count FROM appliances WHERE id = ?",
@@ -644,15 +766,26 @@ def update_appliance_scrape(
                 """,
                 (now, err, status, sample_count, fail_count, now, appliance_id),
             )
+            return (1 if ok else 0, err)
+
+    ok_flag, err = _retry_locked(_do_catalog)
+
+    def _do_metrics() -> None:
+        with connect_metrics(appliance_id) as conn:
             conn.execute(
                 """
-                INSERT INTO scrape_runs (appliance_id, started_at, finished_at, ok, source, sample_count, error)
+                INSERT INTO scrape_runs
+                    (appliance_id, started_at, finished_at, ok, source, sample_count, error)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (appliance_id, now, now, 1 if ok else 0, source, sample_count, err),
+                (appliance_id, now, now, ok_flag, source, sample_count, err),
             )
 
-    _retry_locked(_do)
+    try:
+        _retry_metrics_locked(appliance_id, _do_metrics)
+    except Exception:
+        # Catalog status already updated; scrape_runs is best-effort telemetry.
+        pass
 
 
 def reset_appliance_failures(appliance_id: int) -> None:
@@ -718,11 +851,9 @@ def ensure_offline_status(appliance_id: int) -> None:
 
 
 def delete_appliance(appliance_id: int) -> bool:
-    """Synchronously remove an appliance (used by tests / small DBs).
-
-    Prefer ``begin_appliance_delete`` + background purge for production UIs.
-    """
+    """Synchronously remove an appliance and its metrics DB file."""
     init_db()
+    aid = int(appliance_id)
 
     def _do() -> bool:
         with connect(timeout=60.0) as conn:
@@ -734,230 +865,72 @@ def delete_appliance(appliance_id: int) -> bool:
                     updated_at = ?
                 WHERE parent_appliance_id = ?
                 """,
-                (time.time(), appliance_id),
+                (time.time(), aid),
             )
-            conn.execute("DELETE FROM metric_points WHERE appliance_id = ?", (appliance_id,))
-            conn.execute("DELETE FROM scrape_runs WHERE appliance_id = ?", (appliance_id,))
-            conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (appliance_id,))
-            cur = conn.execute("DELETE FROM appliances WHERE id = ?", (appliance_id,))
+            conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (aid,))
+            conn.execute("DELETE FROM healthcheck_runs WHERE appliance_id = ?", (aid,))
+            cur = conn.execute("DELETE FROM appliances WHERE id = ?", (aid,))
             return cur.rowcount > 0
 
-    return bool(_retry_locked(_do))
+    removed = bool(_retry_locked(_do))
+    drop_metrics_db(aid)
+    return removed
 
 
 def begin_appliance_delete(appliance_id: int) -> dict[str, Any] | None:
-    """Mark appliance for async delete: hide from UI, wipe creds, stop scraping.
+    """Remove the appliance immediately (catalog row + metrics file).
 
-    Returns a label dict for notifications, or None if not found / already gone.
+    Returns a label dict for API responses, or None if not found.
     """
     init_db()
-    now = time.time()
-
-    def _do() -> dict[str, Any] | None:
-        with connect() as conn:
-            row = conn.execute(
-                "SELECT id, host, display_name, delete_pending FROM appliances WHERE id = ?",
-                (appliance_id,),
-            ).fetchone()
-            if not row:
-                return None
-            already = int(row["delete_pending"] or 0) == 1
-            # Detach cluster members that pointed at this node.
-            conn.execute(
-                """
-                UPDATE appliances
-                SET parent_appliance_id = NULL,
-                    cluster_role = CASE WHEN cluster_role = 'member' THEN NULL ELSE cluster_role END,
-                    updated_at = ?
-                WHERE parent_appliance_id = ?
-                """,
-                (now, appliance_id),
-            )
-            # Wipe secrets immediately; keep the row until history is purged.
-            blank = encrypt_text("")
-            conn.execute(
-                """
-                UPDATE appliances
-                SET delete_pending = 1,
-                    enabled = 0,
-                    last_status = 'deleting',
-                    last_error = NULL,
-                    password_enc = ?,
-                    jwt = NULL,
-                    jwt_expires_at = NULL,
-                    metrics_token = NULL,
-                    ops_snapshot_json = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (blank, now, appliance_id),
-            )
-            return {
-                "id": int(row["id"]),
-                "host": row["host"],
-                "display_name": row["display_name"],
-                "already_deleting": already,
-            }
-
-    return _retry_locked(_do)
+    aid = int(appliance_id)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, host, display_name, delete_pending FROM appliances WHERE id = ?",
+            (aid,),
+        ).fetchone()
+    if not row:
+        return None
+    already = int(row["delete_pending"] or 0) == 1
+    meta = {
+        "id": int(row["id"]),
+        "host": row["host"],
+        "display_name": row["display_name"],
+        "already_deleting": already,
+    }
+    delete_appliance(aid)
+    return meta
 
 
 def delete_metric_points_batch(appliance_id: int, batch_size: int = 2_000) -> int:
-    """Delete up to ``batch_size`` history rows for one appliance. Returns rows removed.
-
-    Uses a short busy timeout so Add/Connect are not blocked for minutes when a
-    purge batch cannot get the write lock quickly.
-    """
-    init_db()
-    last: Exception | None = None
-    for i in range(4):
-        try:
-            conn = sqlite3.connect(str(db_path()), timeout=5.0, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            try:
-                conn.execute("PRAGMA busy_timeout = 5000")
-                conn.execute("PRAGMA journal_mode = WAL")
-                try:
-                    cur = conn.execute(
-                        "DELETE FROM metric_points WHERE appliance_id = ? LIMIT ?",
-                        (appliance_id, batch_size),
-                    )
-                except sqlite3.OperationalError as exc:
-                    if "limit" not in str(exc).lower():
-                        raise
-                    cur = conn.execute(
-                        """
-                        DELETE FROM metric_points
-                        WHERE rowid IN (
-                            SELECT rowid FROM metric_points
-                            WHERE appliance_id = ?
-                            LIMIT ?
-                        )
-                        """,
-                        (appliance_id, batch_size),
-                    )
-                n = int(cur.rowcount)
-                conn.commit()
-                return n
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
-        except sqlite3.OperationalError as exc:
-            last = exc
-            msg = str(exc).lower()
-            if "locked" not in msg and "busy" not in msg:
-                raise
-            time.sleep(0.4 * (i + 1))
-    assert last is not None
-    raise last
+    """No-op stub — history lives in a per-appliance file removed on delete."""
+    return 0
 
 
 def detach_appliance_identity(appliance_id: int, label: str | None = None) -> bool:
-    """Remove the appliance row immediately without cascading metric history.
-
-    Temporarily disables foreign keys so CASCADE does not wipe millions of
-    metric_points in one blocking transaction. History is purged afterward in
-    chunks via ``delete_metric_points_batch``. Enqueues the id so a restart can
-    resume the purge.
-    """
-    init_db()
-    now = time.time()
-
-    def _do() -> bool:
-        with connect(timeout=60.0) as conn:
-            row = conn.execute(
-                "SELECT id, display_name, host FROM appliances WHERE id = ?",
-                (appliance_id,),
-            ).fetchone()
-            name = label
-            if not name and row is not None:
-                name = (row["display_name"] or row["host"] or f"#{appliance_id}")
-            conn.execute("PRAGMA foreign_keys=OFF")
-            try:
-                conn.execute("DELETE FROM scrape_runs WHERE appliance_id = ?", (appliance_id,))
-                conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (appliance_id,))
-                conn.execute("DELETE FROM healthcheck_runs WHERE appliance_id = ?", (appliance_id,))
-                cur = conn.execute("DELETE FROM appliances WHERE id = ?", (appliance_id,))
-                removed = cur.rowcount > 0
-            finally:
-                conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute(
-                """
-                INSERT INTO metric_purge_queue (appliance_id, label, created_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(appliance_id) DO UPDATE SET label = excluded.label
-                """,
-                (appliance_id, name or f"#{appliance_id}", now),
-            )
-            return removed or row is not None
-
-    return bool(_retry_locked(_do))
+    """Compatibility wrapper — sync-deletes the appliance (file + catalog)."""
+    del label  # unused; kept for call-site compatibility
+    return delete_appliance(appliance_id)
 
 
 def list_metric_purge_queue() -> list[dict[str, Any]]:
-    init_db()
-    with connect(timeout=15.0) as conn:
-        rows = conn.execute(
-            "SELECT appliance_id, label, created_at FROM metric_purge_queue ORDER BY created_at ASC"
-        ).fetchall()
-    return [dict(r) for r in rows]
+    """No-op stub — purge queue is unused with per-appliance metrics files."""
+    return []
 
 
 def clear_metric_purge_queue(appliance_id: int) -> None:
-    init_db()
-
-    def _do() -> None:
-        with connect() as conn:
-            conn.execute("DELETE FROM metric_purge_queue WHERE appliance_id = ?", (appliance_id,))
-
-    _retry_locked(_do)
+    """No-op stub — purge queue is unused with per-appliance metrics files."""
+    del appliance_id
 
 
 def finalize_appliance_delete(appliance_id: int) -> bool:
-    """Remove remaining small rows / appliance identity after history purge."""
-    init_db()
-
-    def _do() -> bool:
-        with connect(timeout=60.0) as conn:
-            conn.execute("PRAGMA foreign_keys=OFF")
-            try:
-                conn.execute("DELETE FROM scrape_runs WHERE appliance_id = ?", (appliance_id,))
-                conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (appliance_id,))
-                conn.execute("DELETE FROM healthcheck_runs WHERE appliance_id = ?", (appliance_id,))
-                cur = conn.execute("DELETE FROM appliances WHERE id = ?", (appliance_id,))
-                removed = cur.rowcount > 0
-            finally:
-                conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("DELETE FROM metric_purge_queue WHERE appliance_id = ?", (appliance_id,))
-            return removed
-
-    return bool(_retry_locked(_do))
+    """Compatibility wrapper — ensures sync delete completed."""
+    return delete_appliance(appliance_id)
 
 
 def mark_appliance_delete_failed(appliance_id: int, error: str) -> None:
-    """Surface a failed background delete back in the appliance list."""
-    init_db()
-    now = time.time()
-    msg = (error or "Background delete failed")[:2000]
-
-    def _do() -> None:
-        with connect() as conn:
-            conn.execute(
-                """
-                UPDATE appliances
-                SET delete_pending = 0,
-                    enabled = 0,
-                    last_status = 'delete_failed',
-                    last_error = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (msg, now, appliance_id),
-            )
-
-    _retry_locked(_do)
+    """No-op stub — deletes are synchronous; nothing to mark failed."""
+    del appliance_id, error
 
 
 def add_notification(
@@ -1150,30 +1123,32 @@ def insert_metric_points(
 ) -> None:
     """points: (fingerprint, metric_name, labels, ts, value)
 
-    Commits in chunks so concurrent dashboard SELECTs can interleave instead of
-    waiting on one giant scrape transaction.
-
-    Does not hold the module ``_lock`` for the whole insert — that starved chart
-    reads during scrapes. Run ``vacuum_db`` only with the service stopped.
+    Writes into the per-appliance metrics DB. Commits in chunks so concurrent
+    dashboard SELECTs can interleave. Uses a per-appliance lock (not the
+    catalog lock) so scrapes of different appliances do not serialize.
     """
     if not points:
         return
     init_db()
+    aid = int(appliance_id)
+    ensure_metrics_db(aid)
     rows = [
-        (appliance_id, fp, name, json.dumps(labels, sort_keys=True), ts, value)
+        (aid, fp, name, json.dumps(labels, sort_keys=True), ts, value)
         for fp, name, labels, ts, value in points
     ]
     sql = """
         INSERT INTO metric_points (appliance_id, fingerprint, metric_name, labels_json, ts, value)
         VALUES (?, ?, ?, ?, ?, ?)
     """
+    lock = _metrics_lock_for(aid)
     for start in range(0, len(rows), _INSERT_BATCH_SIZE):
         chunk = rows[start : start + _INSERT_BATCH_SIZE]
         last: Exception | None = None
         for i in range(8):
             try:
-                with connect(timeout=30.0) as conn:
-                    conn.executemany(sql, chunk)
+                with lock:
+                    with connect_metrics(aid, timeout=30.0) as conn:
+                        conn.executemany(sql, chunk)
                 break
             except sqlite3.OperationalError as exc:
                 last = exc
@@ -1217,7 +1192,7 @@ def load_series(
     *,
     until: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Load metric history for charts.
+    """Load metric history for charts from the per-appliance metrics DB.
 
     For short windows this is a single indexed ``ORDER BY ts DESC LIMIT`` query.
     For longer windows (``since`` older than ~2h) it reads several time slices so
@@ -1231,8 +1206,8 @@ def load_series(
     window = max(0.0, effective_until - effective_since)
 
     def _query_slice(lo: float, hi: float, slice_limit: int, conn: Any) -> list[Any]:
-        clauses = ["appliance_id = ?", "ts >= ?", "ts <= ?"]
-        params: list[Any] = [appliance_id, lo, hi]
+        clauses = ["ts >= ?", "ts <= ?"]
+        params: list[Any] = [lo, hi]
         if fingerprint:
             clauses.append("fingerprint = ?")
             params.append(fingerprint)
@@ -1247,15 +1222,11 @@ def load_series(
         return list(reversed(conn.execute(sql, params).fetchall()))
 
     # Short windows: one fast indexed read.
-    # (Do not skip stratification based on ``limit`` alone — small limits on
-    # long windows still need time slices or high-cardinality metrics collapse
-    # to only the newest seconds.)
     if window <= 7200:
-        with connect_read() as conn:
+        with connect_metrics_read(appliance_id) as conn:
             return _rows_to_series(_query_slice(effective_since, effective_until, limit, conn))
 
     # Long windows: stratified slices (oldest → newest) for even chart coverage.
-    # Keep slice count modest — each slice is a separate indexed query.
     if window <= 6 * 3600:
         n_slices = 3
     elif window <= 24 * 3600:
@@ -1266,7 +1237,7 @@ def load_series(
     slice_width = window / n_slices
     merged: list[Any] = []
     seen: set[tuple[str, float]] = set()
-    with connect_read() as conn:
+    with connect_metrics_read(appliance_id) as conn:
         for i in range(n_slices):
             lo = effective_since + i * slice_width
             hi = effective_until if i == n_slices - 1 else (effective_since + (i + 1) * slice_width)
@@ -1279,7 +1250,6 @@ def load_series(
 
     merged.sort(key=lambda r: float(r["ts"]))
     if len(merged) > limit:
-        # Keep evenly spaced points if slices overshot.
         step = len(merged) / limit
         merged = [merged[int(i * step)] for i in range(limit)]
     return _rows_to_series(merged)
@@ -1288,45 +1258,38 @@ def load_series(
 def load_latest_samples(appliance_id: int, max_age_seconds: float = 120.0) -> list[dict[str, Any]]:
     """Return one row per fingerprint from the most recent scrape window.
 
-    Uses ``appliances.last_scrape_at`` instead of ``MAX(ts)`` over the full
-    metric_points table (which is multi‑GB and extremely slow).
+    Uses catalog ``appliances.last_scrape_at``; metric rows come from the
+    per-appliance metrics DB.
     """
     init_db()
-    with connect() as conn:
+    with connect_read() as conn:
         meta = conn.execute(
             "SELECT last_scrape_at FROM appliances WHERE id = ?",
             (appliance_id,),
         ).fetchone()
-        latest_ts: float | None = None
-        if meta and meta["last_scrape_at"] is not None:
-            latest_ts = float(meta["last_scrape_at"])
-        if latest_ts is None:
-            # Rare fallback for rows written before last_scrape_at existed.
-            row = conn.execute(
-                """
-                SELECT ts FROM metric_points
-                WHERE appliance_id = ?
-                ORDER BY ts DESC
-                LIMIT 1
-                """,
-                (appliance_id,),
+    latest_ts: float | None = None
+    if meta and meta["last_scrape_at"] is not None:
+        latest_ts = float(meta["last_scrape_at"])
+    if latest_ts is None:
+        with connect_metrics_read(appliance_id) as mconn:
+            row = mconn.execute(
+                "SELECT ts FROM metric_points ORDER BY ts DESC LIMIT 1"
             ).fetchone()
-            if not row:
-                return []
-            latest_ts = float(row["ts"])
-        # Tight window around the last scrape — not a wide max_age scan.
-        lo = latest_ts - min(5.0, max_age_seconds)
-        hi = latest_ts + 2.0
-        rows = conn.execute(
+        if not row:
+            return []
+        latest_ts = float(row["ts"])
+    lo = latest_ts - min(5.0, max_age_seconds)
+    hi = latest_ts + 2.0
+    with connect_metrics_read(appliance_id) as mconn:
+        rows = mconn.execute(
             """
             SELECT fingerprint, metric_name, labels_json, ts, value
             FROM metric_points
-            WHERE appliance_id = ? AND ts >= ? AND ts <= ?
+            WHERE ts >= ? AND ts <= ?
             ORDER BY ts ASC
             """,
-            (appliance_id, lo, hi),
+            (lo, hi),
         ).fetchall()
-    # last value wins per fingerprint
     by_fp: dict[str, dict[str, Any]] = {}
     for r in rows:
         by_fp[r["fingerprint"]] = {
@@ -1342,15 +1305,15 @@ def load_latest_samples(appliance_id: int, max_age_seconds: float = 120.0) -> li
 def load_latest_gauge(appliance_id: int, metric_name: str) -> float | None:
     """Latest value for one gauge metric — cheap indexed lookup (no full hydrate)."""
     init_db()
-    with connect() as conn:
+    with connect_metrics_read(appliance_id) as conn:
         row = conn.execute(
             """
             SELECT value FROM metric_points
-            WHERE appliance_id = ? AND metric_name = ?
+            WHERE metric_name = ?
             ORDER BY ts DESC
             LIMIT 1
             """,
-            (appliance_id, metric_name),
+            (metric_name,),
         ).fetchone()
     if not row:
         return None
@@ -1372,77 +1335,98 @@ def appliance_uptime_seconds(appliance_id: int) -> float | None:
     return up if up >= 0 else None
 
 
+def _optimize_one(path: Path) -> None:
+    conn = sqlite3.connect(str(path), timeout=60.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 60000")
+        conn.execute("PRAGMA analysis_limit=1000")
+        conn.execute("PRAGMA optimize")
+    finally:
+        conn.close()
+
+
 def optimize_db() -> None:
     """Cheap SQLite maintenance — refresh query-planner stats after large changes.
 
-    Safe to run while the app is live. Prefer this over ``vacuum_db`` for routine use.
+    Operates on the catalog DB and every per-appliance metrics file. Safe to run
+    while the app is live. Prefer this over ``vacuum_db`` for routine use.
     """
     init_db()
 
-    def _do() -> None:
-        with connect() as conn:
-            # Bound analysis work on multi‑GB DBs so optimize stays quick.
-            conn.execute("PRAGMA analysis_limit=1000")
-            conn.execute("PRAGMA optimize")
+    def _do_catalog() -> None:
+        _optimize_one(db_path())
 
-    _retry_locked(_do)
+    try:
+        _retry_locked(_do_catalog)
+    except sqlite3.OperationalError:
+        pass
+
+    for path in list_metrics_db_paths():
+        try:
+            _optimize_one(path)
+        except sqlite3.OperationalError:
+            continue
+
+
+def _vacuum_one(path: Path) -> tuple[int, int]:
+    before = int(path.stat().st_size) if path.exists() else 0
+    conn = sqlite3.connect(str(path), timeout=120.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 120000")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA analysis_limit=1000")
+        conn.execute("PRAGMA optimize")
+    finally:
+        conn.close()
+    after = int(path.stat().st_size) if path.exists() else 0
+    return before, after
 
 
 def vacuum_db() -> dict[str, int]:
-    """Full database rewrite to reclaim free pages after large deletes.
+    """Full rewrite of catalog + all metrics DBs to reclaim free pages.
 
-    Blocks writers, can take a long time on multi‑GB files, and needs roughly
-    as much free disk as the current DB size. Intended for rare manual
-    maintenance windows — not the scrape loop. Day-to-day use ``optimize_db``.
-
-    Stop ``cm-metrics`` before running. Inserts intentionally do not hold the
-    module write lock for long periods, so a live VACUUM can race scrapes.
+    Blocks writers, can take a long time on large files, and needs free disk.
+    Intended for rare manual maintenance — stop ``cm-metrics`` first.
     """
     init_db()
-    path = db_path()
-    before = int(path.stat().st_size)
+    paths = [db_path(), *list_metrics_db_paths()]
+    before_total = 0
+    after_total = 0
     last: Exception | None = None
 
-    def _do() -> None:
-        # VACUUM must not run inside the normal commit-on-exit helper transaction.
-        conn = sqlite3.connect(str(path), timeout=120.0)
-        try:
-            conn.execute("PRAGMA busy_timeout = 120000")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.execute("VACUUM")
-            conn.execute("PRAGMA analysis_limit=1000")
-            conn.execute("PRAGMA optimize")
-        finally:
-            conn.close()
+    for path in paths:
+        if not path.exists():
+            continue
+        for i in range(6):
+            try:
+                # Catalog uses the global lock; metrics files use their own briefly.
+                with _lock:
+                    b, a = _vacuum_one(path)
+                before_total += b
+                after_total += a
+                break
+            except sqlite3.OperationalError as exc:
+                last = exc
+                msg = str(exc).lower()
+                if "locked" not in msg and "busy" not in msg:
+                    raise
+                time.sleep(0.5 * (i + 1))
+        else:
+            assert last is not None
+            raise last
 
-    for i in range(6):
-        try:
-            with _lock:
-                _do()
-            break
-        except sqlite3.OperationalError as exc:
-            last = exc
-            msg = str(exc).lower()
-            if "locked" not in msg and "busy" not in msg:
-                raise
-            time.sleep(0.5 * (i + 1))
-    else:
-        assert last is not None
-        raise last
-
-    after = int(path.stat().st_size)
     return {
-        "before_bytes": before,
-        "after_bytes": after,
-        "reclaimed_bytes": before - after,
+        "before_bytes": before_total,
+        "after_bytes": after_total,
+        "reclaimed_bytes": before_total - after_total,
     }
 
 
 def prune_old_points(keep_days: int | None = None) -> int:
-    """Delete points older than retention.
+    """Delete points older than retention across all per-appliance metrics DBs.
 
-    Deletes in batches so a multi‑GB history purge cannot hold a write lock for
-    the entire table at once (same idea as chunked inserts).
+    Also prunes scrape_runs in each metrics file and fleet_health in the catalog.
     """
     init_db()
     days = keep_days if keep_days is not None else Config.HISTORY_KEEP_DAYS
@@ -1450,44 +1434,70 @@ def prune_old_points(keep_days: int | None = None) -> int:
     batch_size = _PRUNE_BATCH_SIZE
     deleted_total = 0
 
-    while True:
-        def _do_batch() -> int:
-            with connect() as conn:
-                cur = conn.execute(
-                    """
-                    DELETE FROM metric_points
-                    WHERE rowid IN (
-                        SELECT rowid FROM metric_points
-                        WHERE ts < ?
-                        LIMIT ?
+    for path in list_metrics_db_paths():
+        while True:
+            def _do_batch(p: Path = path) -> int:
+                conn = sqlite3.connect(str(p), timeout=60.0)
+                try:
+                    conn.execute("PRAGMA busy_timeout = 60000")
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    cur = conn.execute(
+                        """
+                        DELETE FROM metric_points
+                        WHERE rowid IN (
+                            SELECT rowid FROM metric_points
+                            WHERE ts < ?
+                            LIMIT ?
+                        )
+                        """,
+                        (cutoff, batch_size),
                     )
-                    """,
-                    (cutoff, batch_size),
-                )
-                return int(cur.rowcount)
+                    n = int(cur.rowcount)
+                    conn.commit()
+                    return n
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.close()
 
-        n = int(_retry_locked(_do_batch))
-        deleted_total += n
-        if n < batch_size:
-            break
-        time.sleep(0.01)
+            try:
+                n = int(_do_batch())
+            except sqlite3.OperationalError:
+                break
+            deleted_total += n
+            if n < batch_size:
+                break
+            time.sleep(0.01)
 
-    def _do_meta() -> None:
+        try:
+            conn = sqlite3.connect(str(path), timeout=60.0)
+            try:
+                conn.execute("PRAGMA busy_timeout = 60000")
+                conn.execute("DELETE FROM scrape_runs WHERE started_at < ?", (cutoff,))
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            _optimize_one(path)
+        except sqlite3.OperationalError:
+            pass
+
+    def _do_fleet() -> None:
         with connect() as conn:
-            conn.execute("DELETE FROM scrape_runs WHERE started_at < ?", (cutoff,))
             conn.execute("DELETE FROM fleet_health_samples WHERE ts < ?", (cutoff,))
 
     try:
-        _retry_locked(_do_meta)
+        _retry_locked(_do_fleet)
     except sqlite3.OperationalError:
         pass
 
-    # Always refresh planner stats after prune (even if 0 rows) — cheap, and
-    # keeps indexes honest as the live working set moves forward.
     try:
         optimize_db()
     except sqlite3.OperationalError:
-        # Locked / busy — scrape loop will retry prune later.
         pass
     return deleted_total
 
