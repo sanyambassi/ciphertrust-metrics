@@ -539,6 +539,56 @@ def get_appliance_by_host(host: str, include_secrets: bool = False) -> dict[str,
     return get_appliance(int(row["id"]), include_secrets=include_secrets)
 
 
+def find_appliance_matching_host(
+    *candidates: str | None,
+    include_secrets: bool = False,
+) -> dict[str, Any] | None:
+    """Find an appliance by connect URL **or** stored public/private host.
+
+    Cluster discovery often surfaces the same node as a public IP and a private
+    IP. Matching only ``appliances.host`` would create duplicates (e.g. Node 2
+    twice — once on the public URL, once on ``10.x``).
+    """
+    needles: set[str] = set()
+    for raw in candidates:
+        if not raw or not str(raw).strip():
+            continue
+        try:
+            normalized = normalize_host(str(raw))
+        except ValueError:
+            continue
+        host_only = _strip_scheme(normalized).lower()
+        if host_only:
+            needles.add(host_only)
+            needles.add(normalized.lower())
+    if not needles:
+        return None
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, host, public_host, private_host, node_host
+            FROM appliances
+            WHERE COALESCE(delete_pending, 0) = 0
+            """
+        ).fetchall()
+    for row in rows:
+        fields = (
+            row["host"],
+            row["public_host"],
+            row["private_host"],
+            row["node_host"],
+        )
+        for field in fields:
+            if not field:
+                continue
+            bare = _strip_scheme(str(field)).lower()
+            full = str(field).strip().lower().rstrip("/")
+            if bare in needles or full in needles:
+                return get_appliance(int(row["id"]), include_secrets=include_secrets)
+    return None
+
+
 def create_or_update_appliance(
     host: str,
     username: str,

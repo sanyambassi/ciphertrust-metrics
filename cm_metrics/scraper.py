@@ -405,11 +405,9 @@ class MetricsScraper:
                 added.append(db.get_appliance(parent_id) or source_appliance)
                 continue
 
-            existing = db.get_appliance_by_host(scrape_host)
-            if not existing and private_host:
-                existing = db.get_appliance_by_host(private_host)
-            if not existing and public_host:
-                existing = db.get_appliance_by_host(public_host)
+            existing = db.find_appliance_matching_host(
+                scrape_host, private_host, public_host, peer.get("host")
+            )
 
             auto_name = f"Node {index}"
 
