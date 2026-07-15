@@ -21,14 +21,14 @@ data/
 *.key
 
 # Local deploy / scratch scripts (may contain host credentials)
-_*.py
+# Do not use _*.py — that also matches __init__.py
+_deploy*.py
+_redeploy*.py
+_push*.py
+_tmp*
 _*.txt
 _*.sh
 _*.json
-_tmp*
-_push*
-_deploy*
-_redeploy*
 _res_out*
 
 # IDE

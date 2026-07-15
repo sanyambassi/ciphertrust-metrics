@@ -9,6 +9,7 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request
 
 from . import db
+from . import appliance_delete
 from .client import CMClientError
 from .config import Config
 from .dashboards import get_dashboard, list_dashboard_groups, list_dashboards
@@ -36,6 +37,7 @@ def create_app() -> Flask:
     @app.before_request
     def _ensure_scraper() -> None:
         scraper.start()
+        appliance_delete.ensure_started()
 
     @app.get("/")
     def index():
@@ -55,6 +57,16 @@ def create_app() -> Flask:
         for a in appliances:
             a["peers"] = db.list_cluster_peers(int(a["id"]))
         return jsonify(appliances)
+
+    @app.get("/api/notifications")
+    def api_list_notifications():
+        return jsonify(db.list_active_notifications())
+
+    @app.post("/api/notifications/<int:notification_id>/dismiss")
+    def api_dismiss_notification(notification_id: int):
+        if not db.dismiss_notification(notification_id):
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"ok": True})
 
     @app.post("/api/appliances")
     def api_add_appliance():
@@ -108,15 +120,29 @@ def create_app() -> Flask:
 
     @app.delete("/api/appliances/<int:appliance_id>")
     def api_delete_appliance(appliance_id: int):
+        """Remove appliance immediately from the UI; purge history in the background."""
+        meta = db.begin_appliance_delete(appliance_id)
+        if not meta:
+            return jsonify({"error": "not found"}), 404
         scraper.invalidate_client(appliance_id)
         store.drop(appliance_id)
-        if not db.delete_appliance(appliance_id):
-            return jsonify({"error": "not found"}), 404
+        job = appliance_delete.start_appliance_delete(appliance_id, meta)
         try:
             db.record_fleet_health_sample(force=True)
         except Exception:  # noqa: BLE001
             logger.debug("fleet health sample after delete failed", exc_info=True)
-        return jsonify({"ok": True})
+        label = job.get("label") or meta.get("display_name") or meta.get("host") or f"#{appliance_id}"
+        return jsonify(
+            {
+                "ok": True,
+                "async": True,
+                "already_deleting": bool(meta.get("already_deleting") or job.get("already_running")),
+                "appliance_id": appliance_id,
+                "message": (
+                    f'Removed "{label}" from the list. Metric history is being deleted in the background.'
+                ),
+            }
+        )
 
     @app.post("/api/appliances/<int:appliance_id>/scrape")
     def api_scrape_appliance(appliance_id: int):

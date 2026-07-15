@@ -21,6 +21,7 @@ import {
   loadAppliances,
   handleApplianceAction,
   renderFleetHealth,
+  pollDeleteNotifications,
 } from "./appliances.js";
 import {
   showHealthcheckTab,
@@ -197,6 +198,11 @@ form.addEventListener("submit", async (e) => {
   formError.hidden = true;
   btnConnect.disabled = true;
   btnConnect.textContent = "Connecting…";
+  const stillHint = window.setTimeout(() => {
+    if (btnConnect.disabled) {
+      btnConnect.textContent = "Still connecting… (large DB purge may slow this)";
+    }
+  }, 12000);
   const fd = new FormData(form);
   const body = {
     host: fd.get("host"),
@@ -238,6 +244,7 @@ form.addEventListener("submit", async (e) => {
       formError.textContent = err.message || "Connection failed";
     }
   } finally {
+    window.clearTimeout(stillHint);
     btnConnect.disabled = false;
     btnConnect.textContent = "Connect";
   }
@@ -329,5 +336,9 @@ loadAppliances()
     } catch (_) {
       /* ignore */
     }
+    await pollDeleteNotifications();
+    window.setInterval(() => {
+      void pollDeleteNotifications();
+    }, 12000);
   });
 

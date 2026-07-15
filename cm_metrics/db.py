@@ -41,6 +41,18 @@ def connect(*, timeout: float = 60.0) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextmanager
+def connect_read(*, timeout: float = 15.0) -> Iterator[sqlite3.Connection]:
+    """Read-only style connection — no commit, shorter busy wait for charts."""
+    conn = sqlite3.connect(db_path(), timeout=timeout, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 15000")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def _retry_locked(fn, *, attempts: int = 12, delay: float = 0.2):
     """Retry a DB write when SQLite reports database is locked.
 
@@ -203,11 +215,34 @@ def init_db() -> None:
                 ("private_host", "TEXT"),
                 ("location", "TEXT"),
                 ("cm_uptime", "TEXT"),
+                ("delete_pending", "INTEGER DEFAULT 0"),
             ):
                 try:
                     conn.execute(f"ALTER TABLE appliances ADD COLUMN {col} {typedef}")
                 except sqlite3.OperationalError:
                     pass
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    appliance_id INTEGER,
+                    created_at REAL NOT NULL,
+                    dismissed_at REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metric_purge_queue (
+                    appliance_id INTEGER PRIMARY KEY,
+                    label TEXT,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
             # One-time: move legacy cluster titles off primary display_name into cluster_display_name.
             try:
                 rows = conn.execute(
@@ -298,7 +333,13 @@ def enrich_appliance_network(item: dict[str, Any]) -> dict[str, Any]:
 def list_appliances(include_secrets: bool = False) -> list[dict[str, Any]]:
     init_db()
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM appliances ORDER BY created_at ASC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT * FROM appliances
+            WHERE COALESCE(delete_pending, 0) = 0
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
     out = []
     for row in rows:
         item = dict(row)
@@ -313,6 +354,21 @@ def list_appliances(include_secrets: bool = False) -> list[dict[str, Any]]:
         item["enabled"] = bool(item.get("enabled"))
         out.append(enrich_appliance_network(item))
     return out
+
+
+def list_delete_pending_appliances() -> list[dict[str, Any]]:
+    """Appliances mid-async-delete (hidden from normal list)."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, host, display_name, last_status, last_error, delete_pending
+            FROM appliances
+            WHERE COALESCE(delete_pending, 0) = 1
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_appliance(appliance_id: int, include_secrets: bool = False) -> dict[str, Any] | None:
@@ -662,12 +718,14 @@ def ensure_offline_status(appliance_id: int) -> None:
 
 
 def delete_appliance(appliance_id: int) -> bool:
-    """Remove an appliance and all related history/peers/credentials."""
+    """Synchronously remove an appliance (used by tests / small DBs).
+
+    Prefer ``begin_appliance_delete`` + background purge for production UIs.
+    """
     init_db()
 
     def _do() -> bool:
         with connect(timeout=60.0) as conn:
-            # Detach any cluster members that pointed at this node.
             conn.execute(
                 """
                 UPDATE appliances
@@ -678,11 +736,280 @@ def delete_appliance(appliance_id: int) -> bool:
                 """,
                 (time.time(), appliance_id),
             )
-            # Explicit cleanup so older DBs without CASCADE still purge related rows.
             conn.execute("DELETE FROM metric_points WHERE appliance_id = ?", (appliance_id,))
             conn.execute("DELETE FROM scrape_runs WHERE appliance_id = ?", (appliance_id,))
             conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (appliance_id,))
             cur = conn.execute("DELETE FROM appliances WHERE id = ?", (appliance_id,))
+            return cur.rowcount > 0
+
+    return bool(_retry_locked(_do))
+
+
+def begin_appliance_delete(appliance_id: int) -> dict[str, Any] | None:
+    """Mark appliance for async delete: hide from UI, wipe creds, stop scraping.
+
+    Returns a label dict for notifications, or None if not found / already gone.
+    """
+    init_db()
+    now = time.time()
+
+    def _do() -> dict[str, Any] | None:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT id, host, display_name, delete_pending FROM appliances WHERE id = ?",
+                (appliance_id,),
+            ).fetchone()
+            if not row:
+                return None
+            already = int(row["delete_pending"] or 0) == 1
+            # Detach cluster members that pointed at this node.
+            conn.execute(
+                """
+                UPDATE appliances
+                SET parent_appliance_id = NULL,
+                    cluster_role = CASE WHEN cluster_role = 'member' THEN NULL ELSE cluster_role END,
+                    updated_at = ?
+                WHERE parent_appliance_id = ?
+                """,
+                (now, appliance_id),
+            )
+            # Wipe secrets immediately; keep the row until history is purged.
+            blank = encrypt_text("")
+            conn.execute(
+                """
+                UPDATE appliances
+                SET delete_pending = 1,
+                    enabled = 0,
+                    last_status = 'deleting',
+                    last_error = NULL,
+                    password_enc = ?,
+                    jwt = NULL,
+                    jwt_expires_at = NULL,
+                    metrics_token = NULL,
+                    ops_snapshot_json = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (blank, now, appliance_id),
+            )
+            return {
+                "id": int(row["id"]),
+                "host": row["host"],
+                "display_name": row["display_name"],
+                "already_deleting": already,
+            }
+
+    return _retry_locked(_do)
+
+
+def delete_metric_points_batch(appliance_id: int, batch_size: int = 2_000) -> int:
+    """Delete up to ``batch_size`` history rows for one appliance. Returns rows removed.
+
+    Uses a short busy timeout so Add/Connect are not blocked for minutes when a
+    purge batch cannot get the write lock quickly.
+    """
+    init_db()
+    last: Exception | None = None
+    for i in range(4):
+        try:
+            conn = sqlite3.connect(str(db_path()), timeout=5.0, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA busy_timeout = 5000")
+                conn.execute("PRAGMA journal_mode = WAL")
+                try:
+                    cur = conn.execute(
+                        "DELETE FROM metric_points WHERE appliance_id = ? LIMIT ?",
+                        (appliance_id, batch_size),
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "limit" not in str(exc).lower():
+                        raise
+                    cur = conn.execute(
+                        """
+                        DELETE FROM metric_points
+                        WHERE rowid IN (
+                            SELECT rowid FROM metric_points
+                            WHERE appliance_id = ?
+                            LIMIT ?
+                        )
+                        """,
+                        (appliance_id, batch_size),
+                    )
+                n = int(cur.rowcount)
+                conn.commit()
+                return n
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            last = exc
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            time.sleep(0.4 * (i + 1))
+    assert last is not None
+    raise last
+
+
+def detach_appliance_identity(appliance_id: int, label: str | None = None) -> bool:
+    """Remove the appliance row immediately without cascading metric history.
+
+    Temporarily disables foreign keys so CASCADE does not wipe millions of
+    metric_points in one blocking transaction. History is purged afterward in
+    chunks via ``delete_metric_points_batch``. Enqueues the id so a restart can
+    resume the purge.
+    """
+    init_db()
+    now = time.time()
+
+    def _do() -> bool:
+        with connect(timeout=60.0) as conn:
+            row = conn.execute(
+                "SELECT id, display_name, host FROM appliances WHERE id = ?",
+                (appliance_id,),
+            ).fetchone()
+            name = label
+            if not name and row is not None:
+                name = (row["display_name"] or row["host"] or f"#{appliance_id}")
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("DELETE FROM scrape_runs WHERE appliance_id = ?", (appliance_id,))
+                conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (appliance_id,))
+                conn.execute("DELETE FROM healthcheck_runs WHERE appliance_id = ?", (appliance_id,))
+                cur = conn.execute("DELETE FROM appliances WHERE id = ?", (appliance_id,))
+                removed = cur.rowcount > 0
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                """
+                INSERT INTO metric_purge_queue (appliance_id, label, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(appliance_id) DO UPDATE SET label = excluded.label
+                """,
+                (appliance_id, name or f"#{appliance_id}", now),
+            )
+            return removed or row is not None
+
+    return bool(_retry_locked(_do))
+
+
+def list_metric_purge_queue() -> list[dict[str, Any]]:
+    init_db()
+    with connect(timeout=15.0) as conn:
+        rows = conn.execute(
+            "SELECT appliance_id, label, created_at FROM metric_purge_queue ORDER BY created_at ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_metric_purge_queue(appliance_id: int) -> None:
+    init_db()
+
+    def _do() -> None:
+        with connect() as conn:
+            conn.execute("DELETE FROM metric_purge_queue WHERE appliance_id = ?", (appliance_id,))
+
+    _retry_locked(_do)
+
+
+def finalize_appliance_delete(appliance_id: int) -> bool:
+    """Remove remaining small rows / appliance identity after history purge."""
+    init_db()
+
+    def _do() -> bool:
+        with connect(timeout=60.0) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.execute("DELETE FROM scrape_runs WHERE appliance_id = ?", (appliance_id,))
+                conn.execute("DELETE FROM cluster_peers WHERE appliance_id = ?", (appliance_id,))
+                conn.execute("DELETE FROM healthcheck_runs WHERE appliance_id = ?", (appliance_id,))
+                cur = conn.execute("DELETE FROM appliances WHERE id = ?", (appliance_id,))
+                removed = cur.rowcount > 0
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("DELETE FROM metric_purge_queue WHERE appliance_id = ?", (appliance_id,))
+            return removed
+
+    return bool(_retry_locked(_do))
+
+
+def mark_appliance_delete_failed(appliance_id: int, error: str) -> None:
+    """Surface a failed background delete back in the appliance list."""
+    init_db()
+    now = time.time()
+    msg = (error or "Background delete failed")[:2000]
+
+    def _do() -> None:
+        with connect() as conn:
+            conn.execute(
+                """
+                UPDATE appliances
+                SET delete_pending = 0,
+                    enabled = 0,
+                    last_status = 'delete_failed',
+                    last_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (msg, now, appliance_id),
+            )
+
+    _retry_locked(_do)
+
+
+def add_notification(
+    *,
+    kind: str,
+    title: str,
+    message: str,
+    appliance_id: int | None = None,
+) -> int:
+    init_db()
+    now = time.time()
+
+    def _do() -> int:
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO notifications (kind, title, message, appliance_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (kind, title, message, appliance_id, now),
+            )
+            return int(cur.lastrowid)
+
+    return int(_retry_locked(_do))
+
+
+def list_active_notifications(limit: int = 50) -> list[dict[str, Any]]:
+    init_db()
+    with connect(timeout=15.0) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, kind, title, message, appliance_id, created_at
+            FROM notifications
+            WHERE dismissed_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def dismiss_notification(notification_id: int) -> bool:
+    init_db()
+    now = time.time()
+
+    def _do() -> bool:
+        with connect() as conn:
+            cur = conn.execute(
+                "UPDATE notifications SET dismissed_at = ? WHERE id = ? AND dismissed_at IS NULL",
+                (now, notification_id),
+            )
             return cur.rowcount > 0
 
     return bool(_retry_locked(_do))
@@ -811,15 +1138,23 @@ def list_cluster_peers(appliance_id: int) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+# Keep each write transaction short so chart reads are not blocked for minutes
+# while a full multi‑appliance scrape flushes tens of thousands of points.
+_INSERT_BATCH_SIZE = 2500
+_PRUNE_BATCH_SIZE = 50_000
+
+
 def insert_metric_points(
     appliance_id: int,
     points: list[tuple[str, str, dict[str, str], float, float]],
 ) -> None:
     """points: (fingerprint, metric_name, labels, ts, value)
 
-    Intentionally does NOT take the module-wide writer lock. Metric history
-    inserts can take a long time on large DBs; holding `_lock` blocked Refresh
-    status updates (appliances stuck offline/pending for minutes).
+    Commits in chunks so concurrent dashboard SELECTs can interleave instead of
+    waiting on one giant scrape transaction.
+
+    Does not hold the module ``_lock`` for the whole insert — that starved chart
+    reads during scrapes. Run ``vacuum_db`` only with the service stopped.
     """
     if not points:
         return
@@ -828,26 +1163,49 @@ def insert_metric_points(
         (appliance_id, fp, name, json.dumps(labels, sort_keys=True), ts, value)
         for fp, name, labels, ts, value in points
     ]
-    last: Exception | None = None
-    for i in range(8):
+    sql = """
+        INSERT INTO metric_points (appliance_id, fingerprint, metric_name, labels_json, ts, value)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+    for start in range(0, len(rows), _INSERT_BATCH_SIZE):
+        chunk = rows[start : start + _INSERT_BATCH_SIZE]
+        last: Exception | None = None
+        for i in range(8):
+            try:
+                with connect(timeout=30.0) as conn:
+                    conn.executemany(sql, chunk)
+                break
+            except sqlite3.OperationalError as exc:
+                last = exc
+                msg = str(exc).lower()
+                if "locked" not in msg and "busy" not in msg:
+                    raise
+                time.sleep(0.15 * (i + 1))
+        else:
+            assert last is not None
+            raise last
+        # Brief yield between chunks so WAL readers can proceed.
+        if start + _INSERT_BATCH_SIZE < len(rows):
+            time.sleep(0.01)
+
+
+def _rows_to_series(rows: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
         try:
-            with connect(timeout=30.0) as conn:
-                conn.executemany(
-                    """
-                    INSERT INTO metric_points (appliance_id, fingerprint, metric_name, labels_json, ts, value)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
-            return
-        except sqlite3.OperationalError as exc:
-            last = exc
-            msg = str(exc).lower()
-            if "locked" not in msg and "busy" not in msg:
-                raise
-            time.sleep(0.15 * (i + 1))
-    assert last is not None
-    raise last
+            labels = json.loads(r["labels_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            labels = {}
+        out.append(
+            {
+                "fingerprint": r["fingerprint"],
+                "name": r["metric_name"],
+                "labels": labels if isinstance(labels, dict) else {},
+                "t": r["ts"],
+                "v": r["value"],
+            }
+        )
+    return out
 
 
 def load_series(
@@ -856,60 +1214,117 @@ def load_series(
     metric_name: str | None = None,
     since: float | None = None,
     limit: int = 5000,
+    *,
+    until: float | None = None,
 ) -> list[dict[str, Any]]:
+    """Load metric history for charts.
+
+    For short windows this is a single indexed ``ORDER BY ts DESC LIMIT`` query.
+    For longer windows (``since`` older than ~2h) it reads several time slices so
+    charts keep coverage across the full range instead of only the newest
+    ``limit`` points (important for high-cardinality metrics).
+    """
     init_db()
-    clauses = ["appliance_id = ?"]
-    params: list[Any] = [appliance_id]
-    if fingerprint:
-        clauses.append("fingerprint = ?")
-        params.append(fingerprint)
-    if metric_name:
-        clauses.append("metric_name = ?")
-        params.append(metric_name)
-    if since is not None:
-        clauses.append("ts >= ?")
-        params.append(since)
-    params.append(limit)
-    # Fetch newest first, then reverse so callers get chronological order.
-    sql = (
-        f"SELECT fingerprint, metric_name, labels_json, ts, value FROM metric_points "
-        f"WHERE {' AND '.join(clauses)} ORDER BY ts DESC LIMIT ?"
-    )
-    with connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
-    rows = list(reversed(rows))
-    return [
-        {
-            "fingerprint": r["fingerprint"],
-            "name": r["metric_name"],
-            "labels": json.loads(r["labels_json"]),
-            "t": r["ts"],
-            "v": r["value"],
-        }
-        for r in rows
-    ]
+    now = time.time()
+    effective_until = float(until) if until is not None else now
+    effective_since = float(since) if since is not None else (effective_until - 3600.0)
+    window = max(0.0, effective_until - effective_since)
+
+    def _query_slice(lo: float, hi: float, slice_limit: int, conn: Any) -> list[Any]:
+        clauses = ["appliance_id = ?", "ts >= ?", "ts <= ?"]
+        params: list[Any] = [appliance_id, lo, hi]
+        if fingerprint:
+            clauses.append("fingerprint = ?")
+            params.append(fingerprint)
+        if metric_name:
+            clauses.append("metric_name = ?")
+            params.append(metric_name)
+        params.append(slice_limit)
+        sql = (
+            f"SELECT fingerprint, metric_name, labels_json, ts, value FROM metric_points "
+            f"WHERE {' AND '.join(clauses)} ORDER BY ts DESC LIMIT ?"
+        )
+        return list(reversed(conn.execute(sql, params).fetchall()))
+
+    # Short windows: one fast indexed read.
+    # (Do not skip stratification based on ``limit`` alone — small limits on
+    # long windows still need time slices or high-cardinality metrics collapse
+    # to only the newest seconds.)
+    if window <= 7200:
+        with connect_read() as conn:
+            return _rows_to_series(_query_slice(effective_since, effective_until, limit, conn))
+
+    # Long windows: stratified slices (oldest → newest) for even chart coverage.
+    # Keep slice count modest — each slice is a separate indexed query.
+    if window <= 6 * 3600:
+        n_slices = 3
+    elif window <= 24 * 3600:
+        n_slices = 4
+    else:
+        n_slices = 6
+    slice_limit = max(80, limit // n_slices)
+    slice_width = window / n_slices
+    merged: list[Any] = []
+    seen: set[tuple[str, float]] = set()
+    with connect_read() as conn:
+        for i in range(n_slices):
+            lo = effective_since + i * slice_width
+            hi = effective_until if i == n_slices - 1 else (effective_since + (i + 1) * slice_width)
+            for row in _query_slice(lo, hi, slice_limit, conn):
+                key = (row["fingerprint"], float(row["ts"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(row)
+
+    merged.sort(key=lambda r: float(r["ts"]))
+    if len(merged) > limit:
+        # Keep evenly spaced points if slices overshot.
+        step = len(merged) / limit
+        merged = [merged[int(i * step)] for i in range(limit)]
+    return _rows_to_series(merged)
 
 
 def load_latest_samples(appliance_id: int, max_age_seconds: float = 120.0) -> list[dict[str, Any]]:
-    """Return one row per fingerprint from the most recent scrape window."""
+    """Return one row per fingerprint from the most recent scrape window.
+
+    Uses ``appliances.last_scrape_at`` instead of ``MAX(ts)`` over the full
+    metric_points table (which is multi‑GB and extremely slow).
+    """
     init_db()
     with connect() as conn:
-        row = conn.execute(
-            "SELECT MAX(ts) AS mx FROM metric_points WHERE appliance_id = ?",
+        meta = conn.execute(
+            "SELECT last_scrape_at FROM appliances WHERE id = ?",
             (appliance_id,),
         ).fetchone()
-        if not row or row["mx"] is None:
-            return []
-        latest_ts = float(row["mx"])
-        cutoff = latest_ts - max_age_seconds
+        latest_ts: float | None = None
+        if meta and meta["last_scrape_at"] is not None:
+            latest_ts = float(meta["last_scrape_at"])
+        if latest_ts is None:
+            # Rare fallback for rows written before last_scrape_at existed.
+            row = conn.execute(
+                """
+                SELECT ts FROM metric_points
+                WHERE appliance_id = ?
+                ORDER BY ts DESC
+                LIMIT 1
+                """,
+                (appliance_id,),
+            ).fetchone()
+            if not row:
+                return []
+            latest_ts = float(row["ts"])
+        # Tight window around the last scrape — not a wide max_age scan.
+        lo = latest_ts - min(5.0, max_age_seconds)
+        hi = latest_ts + 2.0
         rows = conn.execute(
             """
             SELECT fingerprint, metric_name, labels_json, ts, value
             FROM metric_points
-            WHERE appliance_id = ? AND ts >= ?
+            WHERE appliance_id = ? AND ts >= ? AND ts <= ?
             ORDER BY ts ASC
             """,
-            (appliance_id, cutoff),
+            (appliance_id, lo, hi),
         ).fetchall()
     # last value wins per fingerprint
     by_fp: dict[str, dict[str, Any]] = {}
@@ -957,20 +1372,124 @@ def appliance_uptime_seconds(appliance_id: int) -> float | None:
     return up if up >= 0 else None
 
 
+def optimize_db() -> None:
+    """Cheap SQLite maintenance — refresh query-planner stats after large changes.
+
+    Safe to run while the app is live. Prefer this over ``vacuum_db`` for routine use.
+    """
+    init_db()
+
+    def _do() -> None:
+        with connect() as conn:
+            # Bound analysis work on multi‑GB DBs so optimize stays quick.
+            conn.execute("PRAGMA analysis_limit=1000")
+            conn.execute("PRAGMA optimize")
+
+    _retry_locked(_do)
+
+
+def vacuum_db() -> dict[str, int]:
+    """Full database rewrite to reclaim free pages after large deletes.
+
+    Blocks writers, can take a long time on multi‑GB files, and needs roughly
+    as much free disk as the current DB size. Intended for rare manual
+    maintenance windows — not the scrape loop. Day-to-day use ``optimize_db``.
+
+    Stop ``cm-metrics`` before running. Inserts intentionally do not hold the
+    module write lock for long periods, so a live VACUUM can race scrapes.
+    """
+    init_db()
+    path = db_path()
+    before = int(path.stat().st_size)
+    last: Exception | None = None
+
+    def _do() -> None:
+        # VACUUM must not run inside the normal commit-on-exit helper transaction.
+        conn = sqlite3.connect(str(path), timeout=120.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 120000")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA analysis_limit=1000")
+            conn.execute("PRAGMA optimize")
+        finally:
+            conn.close()
+
+    for i in range(6):
+        try:
+            with _lock:
+                _do()
+            break
+        except sqlite3.OperationalError as exc:
+            last = exc
+            msg = str(exc).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            time.sleep(0.5 * (i + 1))
+    else:
+        assert last is not None
+        raise last
+
+    after = int(path.stat().st_size)
+    return {
+        "before_bytes": before,
+        "after_bytes": after,
+        "reclaimed_bytes": before - after,
+    }
+
+
 def prune_old_points(keep_days: int | None = None) -> int:
+    """Delete points older than retention.
+
+    Deletes in batches so a multi‑GB history purge cannot hold a write lock for
+    the entire table at once (same idea as chunked inserts).
+    """
     init_db()
     days = keep_days if keep_days is not None else Config.HISTORY_KEEP_DAYS
     cutoff = time.time() - days * 86400
+    batch_size = _PRUNE_BATCH_SIZE
+    deleted_total = 0
 
-    def _do() -> int:
+    while True:
+        def _do_batch() -> int:
+            with connect() as conn:
+                cur = conn.execute(
+                    """
+                    DELETE FROM metric_points
+                    WHERE rowid IN (
+                        SELECT rowid FROM metric_points
+                        WHERE ts < ?
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, batch_size),
+                )
+                return int(cur.rowcount)
+
+        n = int(_retry_locked(_do_batch))
+        deleted_total += n
+        if n < batch_size:
+            break
+        time.sleep(0.01)
+
+    def _do_meta() -> None:
         with connect() as conn:
-            cur = conn.execute("DELETE FROM metric_points WHERE ts < ?", (cutoff,))
-            deleted = cur.rowcount
             conn.execute("DELETE FROM scrape_runs WHERE started_at < ?", (cutoff,))
             conn.execute("DELETE FROM fleet_health_samples WHERE ts < ?", (cutoff,))
-            return int(deleted)
 
-    return int(_retry_locked(_do))
+    try:
+        _retry_locked(_do_meta)
+    except sqlite3.OperationalError:
+        pass
+
+    # Always refresh planner stats after prune (even if 0 rows) — cheap, and
+    # keeps indexes honest as the live working set moves forward.
+    try:
+        optimize_db()
+    except sqlite3.OperationalError:
+        # Locked / busy — scrape loop will retry prune later.
+        pass
+    return deleted_total
 
 
 def _fleet_counts_from_rows(rows: list[Any]) -> dict[str, int]:
@@ -1004,7 +1523,12 @@ def record_fleet_health_sample(*, force: bool = False, min_interval: float = 10.
                 ).fetchone()
                 if last and (now - float(last["ts"])) < min_interval:
                     return None
-            rows = conn.execute("SELECT last_status FROM appliances").fetchall()
+            rows = conn.execute(
+                """
+                SELECT last_status FROM appliances
+                WHERE COALESCE(delete_pending, 0) = 0
+                """
+            ).fetchall()
             counts = _fleet_counts_from_rows(rows)
             conn.execute(
                 """
@@ -1058,7 +1582,12 @@ def load_fleet_health_series(since: float | None = None, limit: int = 20_000) ->
 def appliance_count() -> int:
     init_db()
     with connect() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM appliances").fetchone()
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM appliances
+            WHERE COALESCE(delete_pending, 0) = 0
+            """
+        ).fetchone()
     return int(row["c"]) if row else 0
 
 

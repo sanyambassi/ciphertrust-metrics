@@ -248,27 +248,32 @@ class CMClient:
         except CMClientError as exc:
             out["backups"] = {"error": str(exc)}
 
-        # Users — top recent logins (domain-scoped REST is intentional for Overview).
+        # Users — top by logins_count (domain-scoped REST is intentional for Overview).
         # Do not fetch /vault/keys2 for totals — use Prometheus DEKs for appliance-wide keys.
         try:
             users = self.list_resources("/usermgmt/users", limit=100, max_pages=5)
             items = users["resources"]
-            with_login = [u for u in items if isinstance(u, dict) and u.get("last_login")]
-            with_login.sort(key=lambda u: str(u.get("last_login") or ""), reverse=True)
+            ranked = [
+                u
+                for u in items
+                if isinstance(u, dict)
+                and int(u.get("logins_count") or 0) > 0
+            ]
+            ranked.sort(key=lambda u: int(u.get("logins_count") or 0), reverse=True)
             top = []
-            for u in with_login[:5]:
+            for u in ranked[:5]:
                 top.append(
                     {
                         "username": u.get("username") or "",
                         "name": u.get("name") or "",
                         "email": u.get("email") or "",
                         "last_login": u.get("last_login") or "",
-                        "logins_count": u.get("logins_count"),
+                        "logins_count": int(u.get("logins_count") or 0),
                     }
                 )
             out["users"] = {
                 "total": users["total"],
-                "with_login": len(with_login),
+                "with_login": len(ranked),
                 "top_recent_logins": top,
             }
         except CMClientError as exc:

@@ -210,7 +210,52 @@ class MetricsScraper:
         discover_cluster: bool = True,
         location: str | None = None,
     ) -> dict[str, Any]:
-        """Login, enable metrics, persist appliance, optionally auto-add cluster peers."""
+        """Login, enable metrics, persist appliance, optionally auto-add cluster peers.
+
+        Returns as soon as the appliance is reachable and registered. Metric history
+        insert runs in a background thread so Add Appliance is not blocked behind a
+        multi‑second SQLite write (especially while an old delete purge is running).
+        """
+        from . import appliance_delete
+
+        appliance_delete.pause_purges()
+        persist_store = None
+        try:
+            result, persist_store = self._connect_appliance_core(
+                host=host,
+                username=username,
+                password=password,
+                display_name=display_name,
+                domain=domain,
+                discover_cluster=discover_cluster,
+                location=location,
+            )
+        except Exception:
+            appliance_delete.resume_purges()
+            raise
+
+        def _bg_persist() -> None:
+            try:
+                if persist_store is not None:
+                    persist_store.persist_last_ingest()
+            except Exception:  # noqa: BLE001
+                logger.warning("Background persist after connect failed", exc_info=True)
+            finally:
+                appliance_delete.resume_purges()
+
+        threading.Thread(target=_bg_persist, name="cm-connect-persist", daemon=True).start()
+        return result
+
+    def _connect_appliance_core(
+        self,
+        host: str,
+        username: str,
+        password: str,
+        display_name: str | None = None,
+        domain: str = "",
+        discover_cluster: bool = True,
+        location: str | None = None,
+    ) -> tuple[dict[str, Any], Any]:
         client = CMClient(host=host, username=username, password=password, domain=domain)
         client.login()
         metrics_token = client.ensure_metrics_token()
@@ -252,9 +297,10 @@ class MetricsScraper:
         self.invalidate_client(aid)
         self._clients[aid] = client
 
-        # Initial scrape
+        # Initial scrape into memory + status; SQLite history flush is deferred.
         samples = client.scrape_metrics(metrics_token)
-        self.store.for_appliance(aid).ingest(samples, source="live")
+        store = self.store.for_appliance(aid, hydrate=False)
+        store.ingest(samples, source="live", persist=False)
         db.update_appliance_scrape(aid, ok=True, sample_count=len(samples), source="live")
 
         # Prefetch ksctl from this CM's public /downloads zip (no auth) for healthcheck.
@@ -282,13 +328,16 @@ class MetricsScraper:
             db.record_fleet_health_sample(force=True)
         except Exception:  # noqa: BLE001
             logger.debug("fleet health sample after connect failed", exc_info=True)
-        return {
-            "appliance": appliance,
-            "sample_count": len(samples),
-            "system_info": info,
-            "cluster_peers": peers,
-            "auto_added": added_peers,
-        }
+        return (
+            {
+                "appliance": appliance,
+                "sample_count": len(samples),
+                "system_info": info,
+                "cluster_peers": peers,
+                "auto_added": added_peers,
+            },
+            store,
+        )
 
     def _auto_add_peers(
         self,
@@ -593,6 +642,10 @@ class MetricsScraper:
 
         if not appliance:
             return {"ok": False, "error": "not found"}
+        if int(appliance.get("delete_pending") or 0) == 1 or (
+            appliance.get("last_status") or ""
+        ).lower() in {"deleting"}:
+            return {"ok": False, "skipped": True, "error": "deleting", "appliance_id": appliance_id}
         if not appliance.get("enabled"):
             return {"ok": False, "error": "disabled"}
 
@@ -824,7 +877,13 @@ class MetricsScraper:
                 # Background loop only keeps healthy hosts fresh. Offline/error/
                 # pending are retried on manual Refresh (force=True) so a sick
                 # peer cannot hold scrape locks / DB writers for minutes.
-                if status in {"offline", "error", "pending"} or db.is_appliance_offline(appliance):
+                if status in {
+                    "offline",
+                    "error",
+                    "pending",
+                    "deleting",
+                    "delete_failed",
+                } or db.is_appliance_offline(appliance):
                     if status != "offline" and db.is_appliance_offline(appliance):
                         db.ensure_offline_status(int(appliance["id"]))
                     results.append(
@@ -857,8 +916,13 @@ class MetricsScraper:
                 display_name="Demo Appliance",
             )
             samples = parse_prometheus_text(self._demo.tick())
-            self.store.for_appliance(int(demo["id"])).ingest(samples, source="demo")
+            store = self.store.for_appliance(int(demo["id"]), hydrate=False)
+            store.ingest(samples, source="demo", persist=False)
             db.update_appliance_scrape(int(demo["id"]), ok=True, sample_count=len(samples), source="demo")
+            try:
+                store.persist_last_ingest()
+            except Exception:  # noqa: BLE001
+                logger.warning("Could not persist demo metric points (DB busy)", exc_info=True)
             results.append({"ok": True, "source": "demo", "count": len(samples), "appliance_id": demo["id"]})
         # Fleet online/offline history for the Appliances tab chart.
         try:
@@ -887,7 +951,20 @@ class MetricsScraper:
                 except Exception:  # noqa: BLE001
                     pass
                 self.scrape_all()
+                # ~5% of scrape cycles: drop points older than HISTORY_KEEP_DAYS,
+                # then PRAGMA optimize (cheap planner refresh — not a full VACUUM).
                 if random.random() < 0.05:
-                    db.prune_old_points()
+                    deleted = db.prune_old_points()
+                    if deleted:
+                        logger.info(
+                            "Pruned %s old metric_points (keep_days=%s); PRAGMA optimize ran",
+                            deleted,
+                            Config.HISTORY_KEEP_DAYS,
+                        )
+                    else:
+                        logger.debug(
+                            "Prune found nothing older than %s days; PRAGMA optimize ran",
+                            Config.HISTORY_KEEP_DAYS,
+                        )
             except Exception:  # noqa: BLE001
                 logger.exception("Scrape loop error")

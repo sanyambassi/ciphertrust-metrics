@@ -159,6 +159,7 @@ export function applianceStatusBadge(a) {
   if (a.last_status === "ok") return { cls: "ok", text: "online" };
   if (a.last_status === "offline") return { cls: "offline", text: "offline" };
   if (a.last_status === "error") return { cls: "err", text: "error" };
+  if (a.last_status === "delete_failed") return { cls: "err", text: "delete failed" };
   if (a.last_status === "pending") return { cls: "", text: "retrying" };
   return { cls: "", text: a.last_status || "pending" };
 }
@@ -772,6 +773,43 @@ export function showToast(message, { type = "ok", duration = 3200 } = {}) {
   }, duration);
 }
 
+const _seenNotificationIds = new Set();
+
+/** Surface background appliance-delete failures (and dismiss after showing). */
+export async function pollDeleteNotifications() {
+  try {
+    const notes = await fetchJSON("/api/notifications");
+    if (!Array.isArray(notes) || !notes.length) return;
+    for (const n of notes) {
+      const id = Number(n.id);
+      if (!id || _seenNotificationIds.has(id)) continue;
+      _seenNotificationIds.add(id);
+      const text = n.message || n.title || "A background task failed";
+      showToast(text, { type: "err", duration: 14000 });
+      // Also alert once so it is hard to miss if the toast is overlooked.
+      if (n.kind === "appliance_delete_failed") {
+        window.setTimeout(() => {
+          window.alert(text);
+        }, 200);
+      }
+      try {
+        await fetchJSON(`/api/notifications/${id}/dismiss`, { method: "POST" });
+      } catch {
+        /* keep trying next poll */
+        _seenNotificationIds.delete(id);
+      }
+    }
+    // If a delete failed, appliance may reappear — refresh list.
+    if (notes.some((n) => n.kind === "appliance_delete_failed")) {
+      await loadAppliances({ force: true }).catch(() => null);
+      renderApplianceList(true);
+      await refreshStatus().catch(() => null);
+    }
+  } catch (err) {
+    console.warn("notification poll failed:", err);
+  }
+}
+
 export async function handleApplianceAction(e) {
   const { panelsEl, descEl } = getDom();
   const editBtn = e.target.closest(".appliance-edit");
@@ -793,12 +831,14 @@ export async function handleApplianceAction(e) {
     const id = Number(delBtn.dataset.id);
     const appliance = state.appliances.find((a) => a.id === id);
     const name = appliance?.display_name || appliance?.host || `#${id}`;
-    if (!window.confirm(`Remove appliance "${name}"?\n\nThis deletes stored credentials and metric history for this device.`)) {
+    if (!window.confirm(
+      `Remove appliance "${name}"?\n\nIt disappears from the list immediately. Metric history is deleted in the background (may take several minutes on large databases).`
+    )) {
       return true;
     }
     delBtn.disabled = true;
     try {
-      await fetchJSON(`/api/appliances/${id}`, { method: "DELETE" });
+      const res = await fetchJSON(`/api/appliances/${id}`, { method: "DELETE" });
       // Optimistic UI update so the tree refreshes even if a later poll is slow.
       state.appliances = (state.appliances || []).filter((a) => a.id !== id);
       state._applianceSig = null;
@@ -820,6 +860,12 @@ export async function handleApplianceAction(e) {
         await loadDashboard(state.dashboardId, { forceFull: true });
       }
       await refreshStatus();
+      showToast(res?.message || `Removed "${name}". History purge continues in the background.`, {
+        type: "ok",
+        duration: 5200,
+      });
+      // Keep watching for a background-delete failure notification.
+      void pollDeleteNotifications();
     } catch (err) {
       window.alert(err.message || "Failed to remove appliance");
       await loadAppliances();

@@ -27,6 +27,23 @@ def _series_maxlen(history_seconds: int) -> int:
     return max(50_000, int(history_seconds / interval) + 2_000)
 
 
+# Cap DB reads for chart queries — never pull full multi‑GB history.
+_SERIES_POINT_LIMIT = 10_000
+_SERIES_CACHE_TTL = 45.0
+_DEFAULT_SERIES_WINDOW = 3600.0  # 1h when caller omits since
+
+
+def _series_point_limit(window_seconds: float) -> int:
+    """Fewer raw points for long ranges — load_series also stratifies slices."""
+    if window_seconds <= 3600:
+        return _SERIES_POINT_LIMIT
+    if window_seconds <= 6 * 3600:
+        return 8_000
+    if window_seconds <= 24 * 3600:
+        return 6_000
+    return 5_000
+
+
 class ApplianceStore:
     def __init__(self, appliance_id: int, history_seconds: int) -> None:
         self.appliance_id = appliance_id
@@ -40,57 +57,31 @@ class ApplianceStore:
         self._latest: Snapshot | None = None
         self._hydrated = False
         self._series_hydrated = False
+        # Short-lived chart query cache: (name, since_bucket, limit, labels_key) -> (expires, results)
+        self._series_query_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
+        # Raw DB rows before label filtering — shared across panels that query the
+        # same metric name/window with different label selectors.
+        self._raw_series_cache: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
 
     def hydrate_from_db(self) -> None:
-        """Full hydrate (latest + series). Prefer hydrate_latest_only for scrapes."""
+        """Load latest gauges only. Full series history is queried on demand."""
         self.hydrate_latest_only()
-        self.ensure_series_hydrated()
 
     def hydrate_latest_only(self) -> None:
-        """Fast path: latest scrape gauges only (no multi‑GB series history)."""
+        """Mark store ready without scanning multi‑GB metric_points.
+
+        Latest gauges come from live scrapes into ``_latest``. Chart history is
+        loaded on demand via scoped ``series_by_name`` queries. A full
+        ``load_latest_samples`` over a huge DB was multi‑minute and blocked
+        every dashboard request after restart.
+        """
         if self._hydrated:
             return
-        latest_rows = db.load_latest_samples(self.appliance_id, max_age_seconds=90.0)
-        with self._lock:
-            if latest_rows:
-                samples = [
-                    Sample(name=r["name"], labels=r["labels"], value=r["v"])
-                    for r in latest_rows
-                ]
-                self._latest = Snapshot(
-                    timestamp=max(r["t"] for r in latest_rows),
-                    samples=samples,
-                    source="db",
-                )
-                for r in latest_rows:
-                    self._labels[r["fingerprint"]] = (r["name"], r["labels"])
-            self._hydrated = True
+        self._hydrated = True
 
     def ensure_series_hydrated(self) -> None:
-        """Lazy-load time-series history when charts need it."""
-        if self._series_hydrated:
-            return
-        since = time.time() - self.history_seconds
-        rows = db.load_series(self.appliance_id, since=since, limit=200_000)
-        with self._lock:
-            by_fp: dict[str, list[tuple[float, float]]] = {}
-            labels: dict[str, tuple[str, dict[str, str]]] = {}
-            for row in rows:
-                fp = row["fingerprint"]
-                labels[fp] = (row["name"], row["labels"])
-                by_fp.setdefault(fp, []).append((row["t"], row["v"]))
-            for fp, pts in by_fp.items():
-                # Preserve any newer in-memory points from a live scrape.
-                existing = list(self._series.get(fp, ()))
-                existing_ts = {t for t, _ in existing}
-                merged_pts = [(t, v) for t, v in pts if t not in existing_ts] + existing
-                merged_pts.sort(key=lambda x: x[0])
-                dq = self._series[fp]
-                dq.clear()
-                dq.extend(merged_pts)
-                self._labels[fp] = labels[fp]
-            self._series_hydrated = True
-            self._hydrated = True
+        """No-op. Charts use scoped per-metric DB queries instead of bulk hydrate."""
+        self._series_hydrated = True
 
     def ingest(
         self,
@@ -100,10 +91,10 @@ class ApplianceStore:
         persist: bool = True,
     ) -> None:
         now = time.time()
+        persist_rows: list[tuple[str, str, dict[str, str], float, float]] = []
         with self._lock:
             self._latest = Snapshot(timestamp=now, samples=samples, source=source, error=error)
             cutoff = now - self.history_seconds
-            persist_rows: list[tuple[str, str, dict[str, str], float, float]] = []
             for sample in samples:
                 fp = sample.fingerprint
                 self._series[fp].append((now, sample.value))
@@ -112,8 +103,13 @@ class ApplianceStore:
                     self._series[fp].popleft()
                 persist_rows.append((fp, sample.name, sample.labels, now, sample.value))
             self._pending_persist = (source, persist_rows)
-            if persist:
-                self._persist_rows_unlocked(source, persist_rows)
+            # New scrape invalidates cached chart windows.
+            self._series_query_cache.clear()
+            self._raw_series_cache.clear()
+        # Persist outside the store lock — chunked SQLite writes must not block
+        # concurrent series_by_name / gauge reads on this appliance.
+        if persist:
+            self._persist_rows(source, persist_rows)
 
     def persist_last_ingest(self) -> None:
         """Flush rows from the last ingest(persist=False) to SQLite."""
@@ -123,9 +119,9 @@ class ApplianceStore:
                 return
             source, persist_rows = pending
             self._pending_persist = None
-            self._persist_rows_unlocked(source, persist_rows)
+        self._persist_rows(source, persist_rows)
 
-    def _persist_rows_unlocked(
+    def _persist_rows(
         self,
         source: str,
         persist_rows: list[tuple[str, str, dict[str, str], float, float]],
@@ -172,11 +168,13 @@ class ApplianceStore:
                 )
             else:
                 self._latest = Snapshot(timestamp=now, samples=[sample], source="derived")
-            if persist:
-                db.insert_metric_points(
-                    self.appliance_id,
-                    [(fp, sample.name, sample.labels, now, sample.value)],
-                )
+            self._series_query_cache.clear()
+            self._raw_series_cache.clear()
+        if persist:
+            db.insert_metric_points(
+                self.appliance_id,
+                [(fp, sample.name, sample.labels, now, sample.value)],
+            )
 
     def latest_samples(self) -> list[Sample]:
         with self._lock:
@@ -193,49 +191,128 @@ class ApplianceStore:
         since: float | None = None,
         limit_series: int = 20,
     ) -> list[dict[str, Any]]:
-        self.ensure_series_hydrated()
+        """Return time series for one metric, scoped to the requested window.
+
+        Loads only ``metric_name`` (+ ``since``) from SQLite via the name index —
+        never bulk-hydrates multi‑GB history.
+        """
+        now = time.time()
+        effective_since = float(since) if since is not None else (now - _DEFAULT_SERIES_WINDOW)
+        window = max(0.0, now - effective_since)
+        point_limit = _series_point_limit(window)
+        labels_key = tuple(sorted((labels or {}).items()))
+        # Bucket ``since`` so adjacent panel calls share a cache entry.
+        since_bucket = int(effective_since // 10) * 10
+        cache_key = (name, since_bucket, int(limit_series), point_limit, labels_key)
+
         with self._lock:
-            results: list[dict[str, Any]] = []
-            # Prefer matching against known fingerprints
+            cached = self._series_query_cache.get(cache_key)
+            if cached and cached[0] > now:
+                return cached[1]
+
+        raw_key = (name, since_bucket, point_limit)
+        rows: list[dict[str, Any]] | None = None
+        with self._lock:
+            raw_cached = self._raw_series_cache.get(raw_key)
+            if raw_cached and raw_cached[0] > now:
+                rows = raw_cached[1]
+        if rows is None:
+            rows = db.load_series(
+                self.appliance_id,
+                metric_name=name,
+                since=effective_since,
+                until=now,
+                limit=point_limit,
+            )
+            with self._lock:
+                self._raw_series_cache[raw_key] = (now + _SERIES_CACHE_TTL, rows)
+                if len(self._raw_series_cache) > 40:
+                    expired = [k for k, (exp, _) in self._raw_series_cache.items() if exp <= now]
+                    for key in expired:
+                        self._raw_series_cache.pop(key, None)
+
+        by_fp: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not labels_match(row["labels"], labels):
+                continue
+            fp = row["fingerprint"]
+            entry = by_fp.get(fp)
+            if entry is None:
+                by_fp[fp] = {
+                    "fingerprint": fp,
+                    "name": row["name"],
+                    "labels": row["labels"],
+                    "points": [{"t": row["t"], "v": row["v"]}],
+                }
+            else:
+                entry["points"].append({"t": row["t"], "v": row["v"]})
+
+        with self._lock:
+            # Merge live in-memory points (newer than DB / not yet flushed).
             for fp, (metric_name, metric_labels) in self._labels.items():
                 if metric_name != name:
                     continue
                 if not labels_match(metric_labels, labels):
                     continue
-                pts = self._series.get(fp, deque())
-                series_pts = [{"t": t, "v": v} for t, v in pts if since is None or t >= since]
-                value = series_pts[-1]["v"] if series_pts else None
-                results.append(
-                    {
+                mem_pts = [
+                    {"t": t, "v": v}
+                    for t, v in self._series.get(fp, ())
+                    if t >= effective_since
+                ]
+                if not mem_pts and fp not in by_fp:
+                    continue
+                if fp in by_fp:
+                    existing_ts = {p["t"] for p in by_fp[fp]["points"]}
+                    for p in mem_pts:
+                        if p["t"] not in existing_ts:
+                            by_fp[fp]["points"].append(p)
+                    by_fp[fp]["points"].sort(key=lambda p: p["t"])
+                else:
+                    by_fp[fp] = {
                         "fingerprint": fp,
                         "name": metric_name,
                         "labels": metric_labels,
-                        "points": series_pts,
-                        "value": value,
+                        "points": mem_pts,
                     }
-                )
-                if len(results) >= limit_series:
-                    break
 
-            # Fallback: latest samples may have gauges not yet labeled in _labels after hydrate
-            if not results and self._latest:
+            # Latest-snapshot fallback when DB has nothing yet for this metric.
+            if not by_fp and self._latest:
                 matched = [
                     s
                     for s in self._latest.samples
                     if s.name == name and labels_match(s.labels, labels)
                 ][:limit_series]
                 for sample in matched:
-                    pts = self._series.get(sample.fingerprint, deque())
-                    series_pts = [{"t": t, "v": v} for t, v in pts if since is None or t >= since]
-                    results.append(
-                        {
-                            "fingerprint": sample.fingerprint,
-                            "name": sample.name,
-                            "labels": sample.labels,
-                            "points": series_pts,
-                            "value": sample.value,
-                        }
-                    )
+                    pts = [
+                        {"t": t, "v": v}
+                        for t, v in self._series.get(sample.fingerprint, ())
+                        if t >= effective_since
+                    ]
+                    by_fp[sample.fingerprint] = {
+                        "fingerprint": sample.fingerprint,
+                        "name": sample.name,
+                        "labels": sample.labels,
+                        "points": pts,
+                        "value": sample.value,
+                    }
+
+            ranked = sorted(
+                by_fp.values(),
+                key=lambda item: item["points"][-1]["t"] if item.get("points") else 0.0,
+                reverse=True,
+            )[:limit_series]
+            results: list[dict[str, Any]] = []
+            for item in ranked:
+                pts = item.get("points") or []
+                if "value" not in item:
+                    item["value"] = pts[-1]["v"] if pts else None
+                results.append(item)
+
+            self._series_query_cache[cache_key] = (now + _SERIES_CACHE_TTL, results)
+            if len(self._series_query_cache) > 80:
+                expired = [k for k, (exp, _) in self._series_query_cache.items() if exp <= now]
+                for key in expired:
+                    self._series_query_cache.pop(key, None)
             return results
 
     def gauge_value(self, name: str, labels: dict[str, str] | None = None) -> float | None:

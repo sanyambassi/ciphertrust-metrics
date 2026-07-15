@@ -42,7 +42,10 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
             # per-cpu grouping; use 1 - avg idle rate across series vs total capacity.
             # Simpler: use Host-style 1 - avg(idle rate) when idle rates exist.
             idle_series = store.series_by_name(
-                "node_cpu_seconds_total", {"mode": "idle"}, limit_series=64
+                "node_cpu_seconds_total",
+                {"mode": "idle"},
+                since=_time.time() - 300,
+                limit_series=64,
             )
             idle_rates = []
             for item in idle_series:
@@ -141,7 +144,7 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
             "Top 5 Users by Logins",
             login_bar,
             "",
-            "Root domain only",
+            "Ranked by logins_count (root domain)",
         ),
         _timeseries(
             "Memory Available",
