@@ -9,6 +9,8 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
+import requests
+
 from . import db
 from .client import CMClient, CMClientError
 from .config import Config
@@ -65,6 +67,38 @@ def _tcp_reachable(host: str, *, timeout: float = 3.0) -> bool:
             return True
     except OSError:
         return False
+
+
+def _is_connectivity_error(exc: BaseException | str) -> bool:
+    """True when the appliance is unreachable (should be offline, not error)."""
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.SSLError,
+        ),
+    ):
+        return True
+    msg = (str(exc) if not isinstance(exc, str) else exc).lower()
+    needles = (
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "name or service not known",
+        "nodename nor servname",
+        "failed to resolve",
+        "name resolution",
+        "network is unreachable",
+        "no route to host",
+        "max retries exceeded",
+        "temporarily unavailable",
+        "unreachable",
+        "tcp unreachable",
+    )
+    return any(n in msg for n in needles)
 
 
 # Reuse a compact demo template for optional offline testing
@@ -481,6 +515,7 @@ class MetricsScraper:
                         ok=False,
                         error=f"Cluster peer unreachable via {scrape_host}: {exc}",
                         source="discovery",
+                        mark_offline=_is_connectivity_error(exc),
                     )
                     added.append(db.get_appliance(int(discovered["id"])) or discovered)
 
@@ -771,7 +806,8 @@ class MetricsScraper:
                         else:
                             # Member: refresh peer list only; keep parent linkage
                             db.update_appliance_auth(appliance_id, is_clustered=True, cluster_role="member")
-                except CMClientError:
+                except Exception:  # noqa: BLE001
+                    # Peer discovery is best-effort; never flip a good scrape to error.
                     pass
                 try:
                     self._refresh_system_info(
@@ -780,7 +816,7 @@ class MetricsScraper:
                         self._get_client(appliance),
                         force=force,
                     )
-                except CMClientError:
+                except Exception:  # noqa: BLE001
                     pass
                 try:
                     self._refresh_ops_snapshot(
@@ -789,7 +825,9 @@ class MetricsScraper:
                         self._get_client(appliance),
                         force=force,
                     )
-                except CMClientError:
+                except Exception:  # noqa: BLE001
+                    # Ops REST can fail after metrics already succeeded (timeouts,
+                    # connection drops). Keep last_status=ok from the scrape above.
                     pass
             else:
                 # Still extract peers from metrics labels without REST login
@@ -842,15 +880,19 @@ class MetricsScraper:
                 [], source="error", error=str(exc)
             )
             try:
-                # Force-retry of a previously unreachable host: one hard fail → offline
-                # so the background loop stops hammering it and blocking Refresh.
+                # Unreachable hosts → offline immediately (not sticky "error").
+                # Auth/config failures stay "error" so the UI distinguishes them.
+                # Background scrape_all skips offline/error; without mark_offline,
+                # fail_count would never reach the threshold and status would stick
+                # on error forever after the first timeout.
                 db.update_appliance_scrape(
                     appliance_id,
                     ok=False,
                     sample_count=0,
                     error=str(exc),
                     source="error",
-                    mark_offline=bool(force and was_unreachable),
+                    mark_offline=_is_connectivity_error(exc)
+                    or bool(force and was_unreachable),
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -882,7 +924,24 @@ class MetricsScraper:
                     "deleting",
                     "delete_failed",
                 } or db.is_appliance_offline(appliance):
-                    if status != "offline" and db.is_appliance_offline(appliance):
+                    # Stuck "error" from a timeout never reaches offline because
+                    # background skips retries — promote clear connectivity failures.
+                    if status == "error" and _is_connectivity_error(
+                        str(appliance.get("last_error") or "")
+                    ):
+                        try:
+                            db.update_appliance_scrape(
+                                int(appliance["id"]),
+                                ok=False,
+                                sample_count=0,
+                                error=str(appliance.get("last_error") or "unreachable"),
+                                source="error",
+                                mark_offline=True,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        status = "offline"
+                    elif status != "offline" and db.is_appliance_offline(appliance):
                         db.ensure_offline_status(int(appliance["id"]))
                     results.append(
                         {
