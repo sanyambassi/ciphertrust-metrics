@@ -775,7 +775,68 @@ export function showToast(message, { type = "ok", duration = 3200 } = {}) {
 
 const _seenNotificationIds = new Set();
 
-/** Surface background appliance-delete failures (and dismiss after showing). */
+function ensureNotifyBannerHost() {
+  let host = document.getElementById("notify-banner-host");
+  if (host) return host;
+  host = document.createElement("div");
+  host.id = "notify-banner-host";
+  host.className = "notify-banner-host";
+  const shell = document.getElementById("app-shell");
+  const tabs = document.getElementById("primary-tabs");
+  if (shell && tabs) shell.insertBefore(host, tabs);
+  else document.body.prepend(host);
+  return host;
+}
+
+function renderCrdpBanner(note) {
+  const host = ensureNotifyBannerHost();
+  const existing = host.querySelector(`[data-note-id="${note.id}"]`);
+  if (existing) return;
+  const el = document.createElement("div");
+  el.className = "notify-banner notify-banner-crdp";
+  el.dataset.noteId = String(note.id);
+  el.innerHTML = `
+    <div class="notify-banner-body">
+      <strong>${escapeHtml(note.title || "CRDP update")}</strong>
+      <span>${escapeHtml(note.message || "")}</span>
+    </div>
+    <div class="notify-banner-actions">
+      <button type="button" class="btn btn-sm" data-action="open-crdp">Open CRDP</button>
+      <button type="button" class="btn btn-sm" data-action="dismiss">Dismiss</button>
+    </div>
+  `;
+  el.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("button[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === "open-crdp") {
+      try {
+        const { openCrdpForAppliance } = await import("./dashboard.js");
+        await openCrdpForAppliance(note.appliance_id);
+      } catch (err) {
+        console.warn("open CRDP failed", err);
+      }
+      try {
+        await fetchJSON(`/api/notifications/${note.id}/dismiss`, { method: "POST" });
+      } catch {
+        /* ignore */
+      }
+      el.remove();
+      return;
+    }
+    if (action === "dismiss") {
+      try {
+        await fetchJSON(`/api/notifications/${note.id}/dismiss`, { method: "POST" });
+      } catch {
+        /* ignore */
+      }
+      el.remove();
+    }
+  });
+  host.appendChild(el);
+}
+
+/** Surface background appliance-delete failures and CRDP membership changes. */
 export async function pollDeleteNotifications() {
   try {
     const notes = await fetchJSON("/api/notifications");
@@ -784,6 +845,16 @@ export async function pollDeleteNotifications() {
       const id = Number(n.id);
       if (!id || _seenNotificationIds.has(id)) continue;
       _seenNotificationIds.add(id);
+      const kind = String(n.kind || "");
+      if (kind.startsWith("crdp_")) {
+        renderCrdpBanner(n);
+        showToast(n.message || n.title || "CRDP clients updated", {
+          type: "err",
+          duration: 10000,
+        });
+        // Keep notification until user opens CRDP or dismisses the banner.
+        continue;
+      }
       const text = n.message || n.title || "A background task failed";
       showToast(text, { type: "err", duration: 14000 });
       // Also alert once so it is hard to miss if the toast is overlooked.

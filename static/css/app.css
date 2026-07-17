@@ -1019,6 +1019,102 @@ code {
   border-color: color-mix(in srgb, #dc2626 50%, var(--border));
 }
 
+.notify-banner-host {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 16px;
+  margin-top: 8px;
+}
+
+.notify-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 12%, var(--bg-panel));
+  color: var(--text);
+}
+
+.notify-banner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 0.92rem;
+}
+
+.notify-banner-body strong {
+  font-size: 0.95rem;
+}
+
+.notify-banner-body span {
+  color: var(--muted);
+}
+
+.notify-banner-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.crdp-table .crdp-url-input {
+  width: min(280px, 100%);
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.crdp-table .crdp-url-input.crdp-url-empty:not(:disabled) {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, #fbbf24 18%, var(--bg-panel));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 18%, transparent);
+}
+
+.crdp-table .crdp-url-input.crdp-url-empty:not(:disabled)::placeholder {
+  color: color-mix(in srgb, var(--warn) 35%, var(--muted));
+  font-weight: 400;
+}
+
+.crdp-table .crdp-url-input.crdp-url-empty:not(:disabled):focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--warn) 65%, var(--border));
+  background: color-mix(in srgb, #fbbf24 22%, var(--bg-panel));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 22%, transparent);
+}
+
+[data-theme="light"] .crdp-table .crdp-url-input.crdp-url-empty:not(:disabled) {
+  background: #fff8e8;
+  border-color: #f0c56d;
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.12);
+}
+
+[data-theme="light"] .crdp-table .crdp-url-input.crdp-url-empty:not(:disabled):focus {
+  background: #fff3d6;
+  border-color: #e5a93a;
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.18);
+}
+
+.crdp-table tr.crdp-revoked {
+  opacity: 0.65;
+}
+
+.crdp-table .crdp-err {
+  color: var(--danger);
+  font-size: 0.75rem;
+  margin-top: 2px;
+  max-width: 220px;
+  white-space: normal;
+}
+
 .sidebar {
   border-right: 1px solid var(--border);
   background: var(--sidebar-bg);

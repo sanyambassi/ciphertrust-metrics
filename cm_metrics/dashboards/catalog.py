@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..store import ApplianceStore
-from .cloud import build_cckm, build_cte
+from .cloud import build_cckm, build_crdp, build_cte
 from .crypto import build_kmip, build_nae
 from .host import build_database, build_host, build_services, build_tcp
 from .http_board import build_http
@@ -62,6 +62,7 @@ _DASHBOARD_GROUP: dict[str, str] = {
     "cluster": "network",
     "cckm": "cloud",
     "cte": "cloud",
+    "crdp": "cloud",
     "backups": "ops",
     "scheduler": "ops",
     "quorum": "ops",
@@ -86,7 +87,7 @@ _GROUP_CHIP_ORDER: dict[str, list[str]] = {
     "secrets": ["secrets"],
     "host": ["host", "services", "database", "tcp"],
     "network": ["http", "cluster"],
-    "cloud": ["cckm", "cte"],
+    "cloud": ["cckm", "cte", "crdp"],
     "ops": ["backups", "scheduler", "quorum", "properties", "interfaces", "developer", "explorer"],
 }
 
@@ -273,6 +274,15 @@ DASHBOARDS: list[dict[str, Any]] = [
         "builder": build_cte,
     },
     {
+        "id": "crdp",
+        "title": "CRDP",
+        "icon": "shield",
+        "description": "Active CRDP clients, metrics hosts, and protect/reveal performance.",
+        "min_version": "2.12.0",
+        "group": "cloud",
+        "builder": build_crdp,
+    },
+    {
         "id": "cckm",
         "title": "CCKM / Cloud Keys",
         "icon": "cloud",
@@ -406,6 +416,7 @@ def get_dashboard(
                     "quorum",
                     "properties",
                     "interfaces",
+                    "crdp",
                 }:
                     panels = _layout_panels(builder(store, appliance))
                 else:

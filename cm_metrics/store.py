@@ -89,11 +89,20 @@ class ApplianceStore:
         source: str = "live",
         error: str | None = None,
         persist: bool = True,
+        *,
+        merge: bool = False,
     ) -> None:
         now = time.time()
         persist_rows: list[tuple[str, str, dict[str, str], float, float]] = []
         with self._lock:
-            self._latest = Snapshot(timestamp=now, samples=samples, source=source, error=error)
+            if merge and self._latest and self._latest.samples:
+                by_fp = {s.fingerprint: s for s in self._latest.samples}
+                for sample in samples:
+                    by_fp[sample.fingerprint] = sample
+                combined = list(by_fp.values())
+            else:
+                combined = samples
+            self._latest = Snapshot(timestamp=now, samples=combined, source=source, error=error)
             cutoff = now - self.history_seconds
             for sample in samples:
                 fp = sample.fingerprint

@@ -364,6 +364,38 @@ def init_db() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS crdp_clients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    appliance_id INTEGER NOT NULL,
+                    cm_client_id TEXT NOT NULL,
+                    name TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    connectivity_status TEXT,
+                    app_connector_type TEXT,
+                    app_connector_version TEXT,
+                    client_profile_id TEXT,
+                    last_connected_at TEXT,
+                    metrics_url TEXT,
+                    last_scrape_at REAL,
+                    last_status TEXT,
+                    last_error TEXT,
+                    fail_count INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    seen_at REAL,
+                    UNIQUE (appliance_id, cm_client_id),
+                    FOREIGN KEY (appliance_id) REFERENCES appliances(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crdp_appliance ON crdp_clients(appliance_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crdp_state ON crdp_clients(appliance_id, state)"
+            )
             # One-time: move legacy cluster titles off primary display_name into cluster_display_name.
             try:
                 rows = conn.execute(
@@ -1739,3 +1771,366 @@ def delete_healthcheck_run(appliance_id: int) -> None:
             )
 
     _retry_locked(_write)
+
+
+# --- CRDP clients (active CRDP app connectors registered on a CM) ---------------
+
+
+def list_crdp_clients(
+    appliance_id: int,
+    *,
+    active_only: bool = False,
+) -> list[dict[str, Any]]:
+    init_db()
+    with connect(timeout=15.0) as conn:
+        if active_only:
+            rows = conn.execute(
+                """
+                SELECT * FROM crdp_clients
+                WHERE appliance_id = ? AND state = 'active'
+                ORDER BY name COLLATE NOCASE, cm_client_id
+                """,
+                (appliance_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM crdp_clients
+                WHERE appliance_id = ?
+                ORDER BY
+                  CASE state WHEN 'active' THEN 0 ELSE 1 END,
+                  name COLLATE NOCASE, cm_client_id
+                """,
+                (appliance_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_crdp_client(appliance_id: int, client_pk: int) -> dict[str, Any] | None:
+    init_db()
+    with connect(timeout=15.0) as conn:
+        row = conn.execute(
+            "SELECT * FROM crdp_clients WHERE appliance_id = ? AND id = ?",
+            (appliance_id, client_pk),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def count_crdp_clients(appliance_id: int) -> dict[str, int]:
+    """Counts for dashboard stats (active CRDP only tracked for scrape; revoked kept)."""
+    init_db()
+    with connect(timeout=15.0) as conn:
+        rows = conn.execute(
+            """
+            SELECT state, COUNT(*) AS n FROM crdp_clients
+            WHERE appliance_id = ? AND COALESCE(app_connector_type, '') = 'CRDP'
+            GROUP BY state
+            """,
+            (appliance_id,),
+        ).fetchall()
+        needs = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM crdp_clients
+            WHERE appliance_id = ? AND state = 'active'
+              AND COALESCE(app_connector_type, '') = 'CRDP'
+              AND (metrics_url IS NULL OR TRIM(metrics_url) = '')
+            """,
+            (appliance_id,),
+        ).fetchone()
+    by_state = {str(r["state"]): int(r["n"]) for r in rows}
+    active = int(by_state.get("active") or 0)
+    revoked = int(by_state.get("revoked") or 0)
+    return {
+        "active": active,
+        "revoked": revoked,
+        "total": active + revoked + sum(
+            int(v) for k, v in by_state.items() if k not in {"active", "revoked"}
+        ),
+        "needs_host": int(needs["n"] if needs else 0),
+        "configured": max(0, active - int(needs["n"] if needs else 0)),
+    }
+
+
+def normalize_crdp_metrics_url(raw: str | None) -> str | None:
+    """Normalize user-entered CRDP metrics base URL (http or https).
+
+    Bare host/IP defaults to ``http://`` (common for port 8080). Explicit
+    ``https://`` is preserved; TLS verify is disabled at scrape time.
+    """
+    from urllib.parse import urlparse
+
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        # Port 443 without a scheme → prefer https; otherwise http.
+        hostport = text.split("/")[0]
+        port = None
+        if ":" in hostport and not hostport.startswith("["):
+            # ipv4:port or hostname:port
+            maybe = hostport.rsplit(":", 1)[-1]
+            if maybe.isdigit():
+                port = int(maybe)
+        elif hostport.startswith("[") and "]:" in hostport:
+            maybe = hostport.rsplit("]:", 1)[-1]
+            if maybe.isdigit():
+                port = int(maybe)
+        scheme = "https" if port == 443 else "http"
+        text = f"{scheme}://{text}"
+    parsed = urlparse(text)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("CRDP metrics URL must use http:// or https://")
+    if not parsed.hostname:
+        raise ValueError("CRDP metrics URL is missing a host")
+    base = f"{scheme}://{parsed.netloc}".rstrip("/")
+    if base.lower().endswith("/metrics"):
+        base = base[: -len("/metrics")].rstrip("/")
+    return base or None
+
+
+def update_crdp_metrics_url(
+    appliance_id: int,
+    client_pk: int,
+    metrics_url: str | None,
+) -> dict[str, Any] | None:
+    init_db()
+    url = normalize_crdp_metrics_url(metrics_url)
+    now = time.time()
+
+    def _do() -> dict[str, Any] | None:
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crdp_clients
+                SET metrics_url = ?, updated_at = ?,
+                    last_status = CASE
+                      WHEN ? IS NULL THEN last_status
+                      WHEN last_status = 'needs_host' THEN NULL
+                      ELSE last_status
+                    END,
+                    last_error = CASE WHEN ? IS NULL THEN last_error ELSE NULL END,
+                    fail_count = CASE WHEN ? IS NULL THEN fail_count ELSE 0 END
+                WHERE appliance_id = ? AND id = ?
+                """,
+                (url, now, url, url, url, appliance_id, client_pk),
+            )
+            if cur.rowcount <= 0:
+                return None
+            row = conn.execute(
+                "SELECT * FROM crdp_clients WHERE appliance_id = ? AND id = ?",
+                (appliance_id, client_pk),
+            ).fetchone()
+            return dict(row) if row else None
+
+    return _retry_locked(_do)
+
+
+def update_crdp_scrape_status(
+    client_pk: int,
+    *,
+    ok: bool,
+    error: str | None = None,
+    status: str | None = None,
+) -> None:
+    init_db()
+    now = time.time()
+
+    def _do() -> None:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT fail_count FROM crdp_clients WHERE id = ?",
+                (client_pk,),
+            ).fetchone()
+            prev = int(row["fail_count"] or 0) if row else 0
+            if ok:
+                fail_count = 0
+                st = status or "ok"
+                err = None
+            else:
+                fail_count = prev + 1
+                st = status or "error"
+                err = error
+            conn.execute(
+                """
+                UPDATE crdp_clients
+                SET last_scrape_at = ?, last_status = ?, last_error = ?,
+                    fail_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, st, err, fail_count, now, client_pk),
+            )
+
+    _retry_locked(_do)
+
+
+def sync_crdp_clients(
+    appliance_id: int,
+    clients: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Upsert active CRDP clients from CM; mark missing ones revoked.
+
+    ``clients`` must already be filtered to active CRDP only.
+    Returns membership diff used for notifications.
+    """
+    init_db()
+    now = time.time()
+    incoming: dict[str, dict[str, Any]] = {}
+    for raw in clients:
+        cid = str(raw.get("id") or "").strip()
+        if not cid:
+            continue
+        incoming[cid] = raw
+
+    def _do() -> dict[str, Any]:
+        with connect() as conn:
+            prev_rows = conn.execute(
+                """
+                SELECT id, cm_client_id, name, state, metrics_url
+                FROM crdp_clients
+                WHERE appliance_id = ? AND state = 'active'
+                  AND COALESCE(app_connector_type, '') = 'CRDP'
+                """,
+                (appliance_id,),
+            ).fetchall()
+            prev_by_cm = {str(r["cm_client_id"]): dict(r) for r in prev_rows}
+            prev_ids = set(prev_by_cm)
+            new_ids = set(incoming)
+
+            added_ids = sorted(new_ids - prev_ids)
+            removed_ids = sorted(prev_ids - new_ids)
+
+            for cid, raw in incoming.items():
+                name = raw.get("name")
+                connectivity = raw.get("connectivity_status")
+                version = raw.get("app_connector_version")
+                profile = raw.get("client_profile_id")
+                last_conn = raw.get("last_connected_at")
+                existing = conn.execute(
+                    """
+                    SELECT id, metrics_url FROM crdp_clients
+                    WHERE appliance_id = ? AND cm_client_id = ?
+                    """,
+                    (appliance_id, cid),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE crdp_clients
+                        SET name = ?, state = 'active',
+                            connectivity_status = ?, app_connector_type = 'CRDP',
+                            app_connector_version = ?, client_profile_id = ?,
+                            last_connected_at = ?, seen_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            name,
+                            connectivity,
+                            version,
+                            profile,
+                            last_conn,
+                            now,
+                            now,
+                            int(existing["id"]),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO crdp_clients (
+                          appliance_id, cm_client_id, name, state,
+                          connectivity_status, app_connector_type,
+                          app_connector_version, client_profile_id,
+                          last_connected_at, metrics_url,
+                          created_at, updated_at, seen_at
+                        ) VALUES (?, ?, ?, 'active', ?, 'CRDP', ?, ?, ?, NULL, ?, ?, ?)
+                        """,
+                        (
+                            appliance_id,
+                            cid,
+                            name,
+                            connectivity,
+                            version,
+                            profile,
+                            last_conn,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+
+            if removed_ids:
+                placeholders = ",".join("?" * len(removed_ids))
+                conn.execute(
+                    f"""
+                    UPDATE crdp_clients
+                    SET state = 'revoked', updated_at = ?,
+                        last_status = COALESCE(last_status, 'revoked')
+                    WHERE appliance_id = ?
+                      AND cm_client_id IN ({placeholders})
+                      AND state = 'active'
+                    """,
+                    (now, appliance_id, *removed_ids),
+                )
+
+            # Recompute needs-host among current active set
+            needs_rows = conn.execute(
+                """
+                SELECT cm_client_id, name FROM crdp_clients
+                WHERE appliance_id = ? AND state = 'active'
+                  AND COALESCE(app_connector_type, '') = 'CRDP'
+                  AND (metrics_url IS NULL OR TRIM(metrics_url) = '')
+                ORDER BY name COLLATE NOCASE
+                """,
+                (appliance_id,),
+            ).fetchall()
+            needs_host = [dict(r) for r in needs_rows]
+
+            added_names = [
+                (incoming[i].get("name") or i) for i in added_ids
+            ]
+            removed_names = [
+                (prev_by_cm[i].get("name") or i) for i in removed_ids
+            ]
+            return {
+                "added": added_ids,
+                "removed": removed_ids,
+                "added_names": added_names,
+                "removed_names": removed_names,
+                "needs_host": needs_host,
+                "active_count": len(new_ids),
+            }
+
+    return _retry_locked(_do)
+
+
+def dismiss_appliance_notifications(appliance_id: int, kinds: list[str] | None = None) -> int:
+    """Dismiss undismissed notifications for an appliance (optionally by kind)."""
+    init_db()
+    now = time.time()
+
+    def _do() -> int:
+        with connect() as conn:
+            if kinds:
+                placeholders = ",".join("?" * len(kinds))
+                cur = conn.execute(
+                    f"""
+                    UPDATE notifications
+                    SET dismissed_at = ?
+                    WHERE appliance_id = ? AND dismissed_at IS NULL
+                      AND kind IN ({placeholders})
+                    """,
+                    (now, appliance_id, *kinds),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE notifications
+                    SET dismissed_at = ?
+                    WHERE appliance_id = ? AND dismissed_at IS NULL
+                    """,
+                    (now, appliance_id),
+                )
+            return int(cur.rowcount)
+
+    return int(_retry_locked(_do))

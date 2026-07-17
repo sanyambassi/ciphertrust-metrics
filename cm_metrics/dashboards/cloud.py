@@ -1,13 +1,15 @@
-"""Cloud dashboards: CTE and CCKM."""
+"""Cloud dashboards: CTE, CCKM, and CRDP."""
 
 from __future__ import annotations
 
 from typing import Any
 
+from .. import db
 from ..store import ApplianceStore
 from .panels import (
     _bar,
     _named_series,
+    _note,
     _stat,
     _timeseries,
 )
@@ -88,6 +90,167 @@ def build_cte(store: ApplianceStore) -> list[dict[str, Any]]:
             ),
         ),
     ]
+
+
+def _sum_metric(store: ApplianceStore, name: str) -> float | None:
+    samples = [s for s in store.latest_samples() if s.name == name]
+    if not samples:
+        return None
+    return store.sum_value(name)
+
+
+def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """CRDP active clients + protect/reveal performance metrics."""
+    appliance_id = int((appliance or {}).get("id") or 0)
+    counts = db.count_crdp_clients(appliance_id) if appliance_id else {
+        "active": 0,
+        "revoked": 0,
+        "total": 0,
+        "needs_host": 0,
+        "configured": 0,
+    }
+    clients = db.list_crdp_clients(appliance_id) if appliance_id else []
+    # Show active first in the config panel; include revoked for visibility.
+    active = [c for c in clients if c.get("state") == "active"]
+    revoked = [c for c in clients if c.get("state") != "active"]
+
+    panels: list[dict[str, Any]] = [
+        _stat("Active CRDP", counts.get("active")),
+        _stat("Configured", counts.get("configured")),
+        _stat("Need Host", counts.get("needs_host"), tone="warning" if counts.get("needs_host") else ""),
+        _stat("Revoked (tracked)", counts.get("revoked")),
+    ]
+
+    if counts.get("needs_host"):
+        panels.append(
+            _note(
+                "Enter each active client's metrics host/IP (CRDP /metrics, often port 8080). "
+                "Only configured hosts are scraped.",
+                title="Metrics host required",
+                tone="warning",
+            )
+        )
+    elif not counts.get("active"):
+        panels.append(
+            _note(
+                "No active CRDP clients on this CipherTrust Manager. "
+                "They appear here after CM registers an application connector.",
+                title="No active CRDP clients",
+                tone="info",
+            )
+        )
+
+    rows = []
+    for c in active + revoked[:20]:
+        rows.append(
+            {
+                "id": c.get("id"),
+                "name": c.get("name") or c.get("cm_client_id") or "",
+                "state": c.get("state") or "",
+                "connectivity": c.get("connectivity_status") or "",
+                "version": c.get("app_connector_version") or "",
+                "metrics_url": c.get("metrics_url") or "",
+                "scrape": c.get("last_status") or ("needs_host" if not c.get("metrics_url") else ""),
+                "error": (c.get("last_error") or "")[:120],
+            }
+        )
+
+    panels.append(
+        {
+            "type": "crdp_clients",
+            "title": "CRDP Clients",
+            "description": "Active CRDP only is scraped. Set Metrics URL to http://host:8080 or https://host (TLS verify is off).",
+            "wide": True,
+            "span": 12,
+            "rows": rows,
+        }
+    )
+
+    protect_ok = _sum_metric(store, "protect_success_count")
+    protect_fail = _sum_metric(store, "protect_failure_count")
+    reveal_ok = _sum_metric(store, "reveal_success_count")
+    reveal_fail = _sum_metric(store, "reveal_failure_count")
+    bulk_protect_ok = _sum_metric(store, "protect_bulk_success_count")
+    bulk_reveal_ok = _sum_metric(store, "reveal_bulk_success_count")
+    unique_ips = _sum_metric(store, "unique_ip_address_count")
+
+    has_perf = any(
+        v is not None
+        for v in (protect_ok, protect_fail, reveal_ok, reveal_fail, bulk_protect_ok, bulk_reveal_ok)
+    )
+
+    panels.extend(
+        [
+            _stat("Protect OK", protect_ok if has_perf else None),
+            _stat("Protect Fail", protect_fail if has_perf else None, tone="fail" if (protect_fail or 0) > 0 else ""),
+            _stat("Reveal OK", reveal_ok if has_perf else None),
+            _stat("Reveal Fail", reveal_fail if has_perf else None, tone="fail" if (reveal_fail or 0) > 0 else ""),
+            _stat("Bulk Protect OK", bulk_protect_ok if has_perf else None),
+            _stat("Bulk Reveal OK", bulk_reveal_ok if has_perf else None),
+            _stat("Unique IPs", unique_ips if has_perf else None),
+        ]
+    )
+
+    if has_perf:
+        panels.extend(
+            [
+                _timeseries(
+                    "Protect Success /s",
+                    _named_series(
+                        store,
+                        "protect_success_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _timeseries(
+                    "Reveal Success /s",
+                    _named_series(
+                        store,
+                        "reveal_success_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _timeseries(
+                    "Protect Failures /s",
+                    _named_series(
+                        store,
+                        "protect_failure_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _timeseries(
+                    "Reveal Failures /s",
+                    _named_series(
+                        store,
+                        "reveal_failure_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _bar(
+                    "Protect Success by App",
+                    store.group_by_label("protect_success_count", "crdp_app_name"),
+                ),
+                _bar(
+                    "Reveal Success by App",
+                    store.group_by_label("reveal_success_count", "crdp_app_name"),
+                ),
+            ]
+        )
+    elif counts.get("configured"):
+        panels.append(
+            _note(
+                "Metrics hosts are saved, but no protect/reveal series yet. "
+                "Confirm Performance Metrics is enabled on the CRDP container and Refresh.",
+                title="Waiting for CRDP /metrics",
+                tone="info",
+            )
+        )
+
+    return panels
 
 
 def _cckm_friendly_label(name: str, prefix: str) -> str:

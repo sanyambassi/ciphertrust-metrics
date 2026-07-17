@@ -45,6 +45,98 @@ class CMClientError(Exception):
         self.payload = payload
 
 
+class CRDPMetricsError(Exception):
+    """CRDP container /metrics scrape failure."""
+
+    def __init__(self, message: str, status_code: int | None = None, *, disabled: bool = False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.disabled = disabled
+
+
+def scrape_crdp_metrics(
+    metrics_url: str,
+    *,
+    timeout: float = 10.0,
+    extra_labels: dict[str, str] | None = None,
+) -> list[Sample]:
+    """GET performance metrics from a CRDP container (/metrics).
+
+    Supports both ``http://`` and ``https://``. TLS certificate verification is
+    always disabled (self-signed / lab CRDP endpoints are common).
+    """
+    base = (metrics_url or "").strip().rstrip("/")
+    if not base:
+        raise CRDPMetricsError("metrics URL is empty")
+    if "://" not in base:
+        # Bare host/IP — default HTTP (typical CRDP :8080); users can set https://.
+        base = f"http://{base}"
+    parsed = urlparse(base)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise CRDPMetricsError(
+            f"CRDP metrics URL must be http:// or https:// (got {scheme or 'none'})"
+        )
+    if not parsed.hostname:
+        raise CRDPMetricsError("CRDP metrics URL is missing a host")
+    # Rebuild without path noise except we append /metrics below.
+    netloc = parsed.netloc
+    base = f"{scheme}://{netloc}".rstrip("/")
+    if base.lower().endswith("/metrics"):
+        url = base
+    else:
+        url = f"{base}/metrics"
+
+    session = requests.Session()
+    session.verify = False
+    # No retries — fail fast so one dead CRDP host cannot stall the CM scrape.
+    retry = Retry(
+        total=0,
+        connect=0,
+        read=0,
+        redirect=0,
+        status=0,
+        other=0,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    try:
+        resp = session.get(
+            url,
+            headers={"Accept": "text/plain"},
+            timeout=timeout,
+            verify=False,
+            allow_redirects=True,
+        )
+    except requests.exceptions.SSLError as exc:
+        raise CRDPMetricsError(
+            f"CRDP HTTPS scrape failed (verify is off; check URL/TLS): {exc}"
+        ) from exc
+    except requests.RequestException as exc:
+        raise CRDPMetricsError(f"CRDP metrics unreachable ({scheme}): {exc}") from exc
+    finally:
+        session.close()
+
+    if resp.status_code == 412:
+        raise CRDPMetricsError(
+            "Performance Metrics is not enabled",
+            status_code=412,
+            disabled=True,
+        )
+    if resp.status_code >= 400:
+        raise CRDPMetricsError(
+            f"CRDP /metrics failed ({resp.status_code}): {resp.text[:300]}",
+            status_code=resp.status_code,
+        )
+    samples = parse_prometheus_text(resp.text)
+    if extra_labels:
+        for sample in samples:
+            sample.labels = {**extra_labels, **sample.labels}
+    return samples
+
+
 class CMClient:
     """Talk to a CipherTrust Manager appliance. SSL verification is always disabled."""
 
@@ -656,6 +748,34 @@ class CMClient:
                 status_code=resp.status_code,
             )
         return parse_prometheus_text(resp.text)
+
+    def list_data_protection_clients(
+        self,
+        *,
+        state: str | None = "active",
+        limit: int = 100,
+        max_pages: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Paginate GET /data-protection/clients (active CRDP discovery)."""
+        out: list[dict[str, Any]] = []
+        skip = 0
+        total: int | None = None
+        for _ in range(max(1, max_pages)):
+            q = f"?skip={skip}&limit={limit}"
+            if state:
+                q = f"?state={state}&skip={skip}&limit={limit}"
+            data = self.get_json(f"/data-protection/clients{q}")
+            if not isinstance(data, dict):
+                break
+            resources = data.get("resources") or []
+            if not isinstance(resources, list):
+                break
+            out.extend(r for r in resources if isinstance(r, dict))
+            total = int(data.get("total") or total or 0)
+            if not resources or (total and len(out) >= total):
+                break
+            skip += limit
+        return out
 
     def list_cluster_nodes(self) -> list[dict[str, Any]]:
         """Discover cluster peers via REST (best-effort across CM versions)."""

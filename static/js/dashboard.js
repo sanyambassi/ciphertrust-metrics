@@ -187,7 +187,7 @@ export function showDashboardGroup(groupId) {
 function panelSpanClass(panel) {
   const span = Number(panel.span);
   if (Number.isFinite(span) && span >= 1 && span <= 12) return `span-${span}`;
-  if (panel.wide || panel.type === "table") return "span-12";
+  if (panel.wide || panel.type === "table" || panel.type === "crdp_clients") return "span-12";
   if (panel.type === "stat") return "span-3";
   if (panel.type === "timeseries" || panel.type === "bar") return "span-6";
   return "span-12";
@@ -452,6 +452,137 @@ function renderTable(panel, animate) {
   return el;
 }
 
+function renderCrdpClients(panel, animate) {
+  const el = document.createElement("article");
+  el.className = `panel table crdp-clients wide ${panelSpanClass(panel)}${animate ? " enter" : ""}`;
+  el.dataset.panelTitle = panel.title;
+  el.dataset.panelType = "crdp_clients";
+  const rows = panel.rows || [];
+  const desc = panel.description
+    ? `<div class="stat-desc">${escapeHtml(panel.description)}</div>`
+    : "";
+  if (!rows.length) {
+    el.innerHTML = `
+      <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+      ${desc}
+      <div class="empty">No CRDP clients discovered yet.</div>
+    `;
+    return el;
+  }
+  el.innerHTML = `
+    <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+    ${desc}
+    <div class="table-wrap">
+      <table class="data crdp-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>State</th>
+            <th>Connectivity</th>
+            <th>Version</th>
+            <th>Metrics URL</th>
+            <th>Scrape</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map((r) => {
+              const id = Number(r.id);
+              const active = String(r.state || "") === "active";
+              const urlEmpty = !String(r.metrics_url || "").trim();
+              const urlClass = [
+                "crdp-url-input",
+                active && urlEmpty ? "crdp-url-empty" : "",
+              ]
+                .filter(Boolean)
+                .join(" ");
+              return `<tr data-crdp-id="${id}" class="${active ? "" : "crdp-revoked"}">
+                <td>${escapeHtml(String(r.name || ""))}</td>
+                <td>${escapeHtml(String(r.state || ""))}</td>
+                <td>${escapeHtml(String(r.connectivity || ""))}</td>
+                <td class="mono">${escapeHtml(String(r.version || ""))}</td>
+                <td>
+                  <input type="text" class="${urlClass}" ${active ? "" : "disabled"}
+                    value="${escapeHtml(String(r.metrics_url || ""))}"
+                    placeholder="http://host:8080 or https://host"
+                    aria-invalid="${active && urlEmpty ? "true" : "false"}" />
+                </td>
+                <td class="mono">${escapeHtml(String(r.scrape || ""))}${
+                  r.error ? `<div class="crdp-err">${escapeHtml(String(r.error))}</div>` : ""
+                }</td>
+                <td>${
+                  active
+                    ? `<button type="button" class="btn btn-sm crdp-save" data-id="${id}">Save</button>`
+                    : ""
+                }</td>
+              </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+  const syncUrlHighlight = (input) => {
+    if (!input || input.disabled) return;
+    const empty = !String(input.value || "").trim();
+    input.classList.toggle("crdp-url-empty", empty);
+    input.setAttribute("aria-invalid", empty ? "true" : "false");
+  };
+  el.querySelectorAll(".crdp-url-input").forEach((input) => {
+    input.addEventListener("input", () => syncUrlHighlight(input));
+    input.addEventListener("change", () => syncUrlHighlight(input));
+  });
+  el.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".crdp-save");
+    if (!btn) return;
+    const clientId = Number(btn.dataset.id);
+    const row = el.querySelector(`tr[data-crdp-id="${clientId}"]`);
+    const input = row?.querySelector(".crdp-url-input");
+    if (!clientId || !input || !state.applianceId) return;
+    btn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = "Saving…";
+    try {
+      await fetchJSON(`/api/appliances/${state.applianceId}/crdp/clients/${clientId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ metrics_url: input.value || "" }),
+      });
+      btn.textContent = "Saved";
+      window.setTimeout(() => {
+        btn.textContent = prev || "Save";
+        btn.disabled = false;
+      }, 900);
+      // Refresh dashboard to pick up scrape status / charts.
+      loadDashboard("crdp", { forceFull: true }).catch(() => null);
+    } catch (err) {
+      btn.textContent = "Error";
+      btn.disabled = false;
+      window.alert(err?.message || String(err));
+      window.setTimeout(() => {
+        btn.textContent = prev || "Save";
+      }, 1200);
+    }
+  });
+  return el;
+}
+
+/** Jump to Connectors → CRDP for a given appliance (notification deep-link). */
+export async function openCrdpForAppliance(applianceId) {
+  const id = Number(applianceId);
+  if (id) {
+    state.applianceId = id;
+    state.panelMeta = null;
+  }
+  state.viewMode = "dashboard";
+  persistTabChip("cloud", "crdp");
+  state.groupId = "cloud";
+  state.dashboardId = "crdp";
+  syncWorkspaceChrome();
+  await loadDashboard("crdp", { forceFull: true });
+}
+
 export function fullRender(data, animate = true) {
   const { panelsEl, titleEl, descEl } = getDom();
   destroyCharts();
@@ -477,6 +608,7 @@ export function fullRender(data, animate = true) {
     else if (panel.type === "timeseries") node = renderTimeseries(panel, animate);
     else if (panel.type === "bar") node = renderBar(panel, animate);
     else if (panel.type === "table") node = renderTable(panel, animate);
+    else if (panel.type === "crdp_clients") node = renderCrdpClients(panel, animate);
     else if (panel.type === "note") node = renderNote(panel, animate);
     else {
       node = document.createElement("article");
@@ -593,6 +725,11 @@ export function updateInPlace(data) {
         return `<td class="${cls}">${escapeHtml(String(r[c] ?? ""))}</td>`;
       }).join("")}</tr>`).join("");
       continue;
+    }
+
+    if (panel.type === "crdp_clients") {
+      // Inputs hold local edits — always full-render this panel.
+      return false;
     }
 
     if (panel.type === "note") {

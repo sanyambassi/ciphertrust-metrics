@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from . import db
-from .client import CMClient, CMClientError
+from .client import CMClient, CMClientError, CRDPMetricsError, scrape_crdp_metrics
 from .config import Config
 from .parser import parse_prometheus_text
 from .store import MetricsStore
@@ -629,6 +629,110 @@ class MetricsScraper:
         if snap:
             db.update_appliance_ops_snapshot(appliance_id, snap)
 
+    def _sync_crdp_clients(
+        self,
+        appliance_id: int,
+        appliance: dict[str, Any],
+        client: CMClient,
+    ) -> None:
+        """Discover active CRDP clients on CM; notify on membership changes."""
+        try:
+            raw = client.list_data_protection_clients(state="active", limit=100)
+        except CMClientError as exc:
+            logger.info("CRDP client list skipped for appliance %s: %s", appliance_id, exc)
+            return
+        active_crdp = [
+            r
+            for r in raw
+            if str(r.get("app_connector_type") or "").strip() == "CRDP"
+            and str(r.get("state") or "").lower() == "active"
+        ]
+        try:
+            diff = db.sync_crdp_clients(appliance_id, active_crdp)
+        except Exception:  # noqa: BLE001
+            logger.exception("CRDP sync failed for appliance %s", appliance_id)
+            return
+
+        added = diff.get("added") or []
+        removed = diff.get("removed") or []
+        if not added and not removed:
+            return
+
+        name = appliance.get("display_name") or appliance.get("host") or f"#{appliance_id}"
+        parts: list[str] = []
+        if added:
+            sample = ", ".join(str(n) for n in (diff.get("added_names") or [])[:3])
+            extra = len(added) - min(3, len(added))
+            more = f" (+{extra} more)" if extra > 0 else ""
+            parts.append(f"{len(added)} new active CRDP client(s){': ' + sample if sample else ''}{more}")
+        if removed:
+            sample = ", ".join(str(n) for n in (diff.get("removed_names") or [])[:3])
+            extra = len(removed) - min(3, len(removed))
+            more = f" (+{extra} more)" if extra > 0 else ""
+            parts.append(
+                f"{len(removed)} CRDP client(s) no longer active"
+                f"{': ' + sample if sample else ''}{more}"
+            )
+        needs = diff.get("needs_host") or []
+        if needs:
+            parts.append(
+                f"{len(needs)} need a metrics host — open Connectors → CRDP"
+            )
+        message = f"{name}: " + "; ".join(parts) + "."
+        try:
+            db.dismiss_appliance_notifications(
+                appliance_id, kinds=["crdp_changed", "crdp_needs_host"]
+            )
+            db.add_notification(
+                kind="crdp_changed",
+                title="CRDP clients updated",
+                message=message,
+                appliance_id=appliance_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not create CRDP notification for %s", appliance_id, exc_info=True)
+
+    def _scrape_crdp_metrics(self, appliance_id: int) -> None:
+        """Scrape /metrics from configured active CRDP hosts into parent metrics DB."""
+        clients = [
+            c
+            for c in db.list_crdp_clients(appliance_id, active_only=True)
+            if str(c.get("app_connector_type") or "") == "CRDP"
+            and (c.get("metrics_url") or "").strip()
+        ]
+        if not clients:
+            return
+        store = self.store.for_appliance(appliance_id, hydrate=False)
+        for row in clients:
+            url = (row.get("metrics_url") or "").strip()
+            pk = int(row["id"])
+            labels = {
+                "crdp_client_id": str(row.get("cm_client_id") or ""),
+                "crdp_app_name": str(row.get("name") or ""),
+                "job": "crdp",
+            }
+            try:
+                samples = scrape_crdp_metrics(url, timeout=10.0, extra_labels=labels)
+                store.ingest(samples, source="live", persist=True, merge=True)
+                db.update_crdp_scrape_status(pk, ok=True, status="ok")
+            except CRDPMetricsError as exc:
+                status = "metrics_disabled" if exc.disabled else "error"
+                logger.warning(
+                    "CRDP scrape failed appliance=%s client=%s: %s",
+                    appliance_id,
+                    row.get("name") or pk,
+                    exc,
+                )
+                db.update_crdp_scrape_status(pk, ok=False, error=str(exc), status=status)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "CRDP scrape error appliance=%s client=%s: %s",
+                    appliance_id,
+                    row.get("name") or pk,
+                    exc,
+                )
+                db.update_crdp_scrape_status(pk, ok=False, error=str(exc), status="error")
+
     def _appliance_scrape_lock(self, appliance_id: int) -> threading.Lock:
         with self._lock:
             lock = self._scrape_locks.get(appliance_id)
@@ -829,6 +933,18 @@ class MetricsScraper:
                     # Ops REST can fail after metrics already succeeded (timeouts,
                     # connection drops). Keep last_status=ok from the scrape above.
                     pass
+                try:
+                    self._sync_crdp_clients(
+                        appliance_id,
+                        appliance,
+                        self._get_client(appliance),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "CRDP discover failed for appliance %s",
+                        appliance_id,
+                        exc_info=True,
+                    )
             else:
                 # Still extract peers from metrics labels without REST login
                 try:
@@ -851,6 +967,16 @@ class MetricsScraper:
                         appliance_id,
                         exc,
                     )
+
+            # CRDP container scrapes only need stored metrics_url (no CM password).
+            try:
+                self._scrape_crdp_metrics(appliance_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "CRDP metrics scrape failed for appliance %s",
+                    appliance_id,
+                    exc_info=True,
+                )
 
             return {"ok": True, "source": "live", "count": len(samples), "appliance_id": appliance_id}
         except Exception as exc:  # noqa: BLE001

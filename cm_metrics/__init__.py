@@ -203,6 +203,40 @@ def create_app() -> Flask:
             return jsonify({"error": "not found"}), 404
         return jsonify(appliance)
 
+    @app.get("/api/appliances/<int:appliance_id>/crdp/clients")
+    def api_list_crdp_clients(appliance_id: int):
+        if not db.get_appliance(appliance_id):
+            return jsonify({"error": "not found"}), 404
+        active_only = request.args.get("active", "0").lower() in {"1", "true", "yes"}
+        return jsonify(
+            {
+                "clients": db.list_crdp_clients(appliance_id, active_only=active_only),
+                "counts": db.count_crdp_clients(appliance_id),
+            }
+        )
+
+    @app.patch("/api/appliances/<int:appliance_id>/crdp/clients/<int:client_id>")
+    def api_patch_crdp_client(appliance_id: int, client_id: int):
+        if not db.get_appliance(appliance_id):
+            return jsonify({"error": "not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        if "metrics_url" not in payload:
+            return jsonify({"error": "metrics_url is required"}), 400
+        try:
+            updated = db.update_crdp_metrics_url(
+                appliance_id, client_id, str(payload.get("metrics_url") or "")
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not updated:
+            return jsonify({"error": "not found"}), 404
+        # Opportunistic scrape of this host after save.
+        try:
+            scraper._scrape_crdp_metrics(appliance_id)  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            pass
+        return jsonify(updated)
+
     # ---- Healthcheck ----------------------------------------------------
 
     @app.get("/api/healthcheck/ksctl")
