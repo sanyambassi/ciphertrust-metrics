@@ -159,7 +159,7 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
         {
             "type": "crdp_clients",
             "title": "CRDP Clients",
-            "description": "Active CRDP only is scraped. Set Metrics URL to http://host:8080 or https://host (TLS verify is off).",
+            "description": "Active CRDP only is scraped. Set Metrics URL to http://host:8080 or https://host.",
             "wide": True,
             "span": 12,
             "rows": rows,
