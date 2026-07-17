@@ -83,6 +83,46 @@ class ApplianceStore:
         """No-op. Charts use scoped per-metric DB queries instead of bulk hydrate."""
         self._series_hydrated = True
 
+    def drop_job(self, job: str) -> None:
+        """Remove latest-snapshot samples for a synthetic job label (e.g. CRDP)."""
+        self.prune_job(job, keep_label=None, keep_values=None)
+
+    def prune_job(
+        self,
+        job: str,
+        *,
+        keep_label: str | None,
+        keep_values: set[str] | None,
+    ) -> None:
+        """Drop ``job`` samples, optionally keeping those whose label is in keep_values.
+
+        If ``keep_values`` is None, all samples for ``job`` are removed.
+        """
+        with self._lock:
+            if not self._latest or not self._latest.samples:
+                return
+            kept: list[Sample] = []
+            changed = False
+            for s in self._latest.samples:
+                labels = s.labels or {}
+                if labels.get("job") != job:
+                    kept.append(s)
+                    continue
+                if keep_values is not None and keep_label and str(labels.get(keep_label) or "") in keep_values:
+                    kept.append(s)
+                    continue
+                changed = True
+            if not changed:
+                return
+            self._latest = Snapshot(
+                timestamp=self._latest.timestamp,
+                samples=kept,
+                source=self._latest.source,
+                error=self._latest.error,
+            )
+            self._series_query_cache.clear()
+            self._raw_series_cache.clear()
+
     def ingest(
         self,
         samples: list[Sample],
@@ -101,7 +141,17 @@ class ApplianceStore:
                     by_fp[sample.fingerprint] = sample
                 combined = list(by_fp.values())
             else:
-                combined = samples
+                # CM Prometheus scrapes replace the snapshot; keep CRDP samples
+                # (job=crdp) so the CRDP tab does not flash zeros between the CM
+                # ingest and the follow-up CRDP /metrics scrape.
+                by_fp: dict[str, Sample] = {}
+                if self._latest and self._latest.samples:
+                    for s in self._latest.samples:
+                        if (s.labels or {}).get("job") == "crdp":
+                            by_fp[s.fingerprint] = s
+                for sample in samples:
+                    by_fp[sample.fingerprint] = sample
+                combined = list(by_fp.values())
             self._latest = Snapshot(timestamp=now, samples=combined, source=source, error=error)
             cutoff = now - self.history_seconds
             for sample in samples:

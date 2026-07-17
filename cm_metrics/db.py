@@ -396,6 +396,10 @@ def init_db() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_crdp_state ON crdp_clients(appliance_id, state)"
             )
+            try:
+                conn.execute("ALTER TABLE crdp_clients ADD COLUMN display_name TEXT")
+            except sqlite3.OperationalError:
+                pass
             # One-time: move legacy cluster titles off primary display_name into cluster_display_name.
             try:
                 rows = conn.execute(
@@ -1894,36 +1898,95 @@ def update_crdp_metrics_url(
     client_pk: int,
     metrics_url: str | None,
 ) -> dict[str, Any] | None:
+    return update_crdp_client(appliance_id, client_pk, metrics_url=metrics_url)
+
+
+def update_crdp_client(
+    appliance_id: int,
+    client_pk: int,
+    *,
+    metrics_url: str | None | object = ...,
+    display_name: str | None | object = ...,
+) -> dict[str, Any] | None:
+    """Update metrics URL and/or user-facing display name for a CRDP client.
+
+    Pass ``...`` (ellipsis) to leave a field unchanged. Empty display_name clears
+    the override so the CM-registered name is shown again.
+    """
     init_db()
-    url = normalize_crdp_metrics_url(metrics_url)
     now = time.time()
+    touch_url = metrics_url is not ...
+    touch_name = display_name is not ...
+    if not touch_url and not touch_name:
+        return get_crdp_client(appliance_id, client_pk)
+
+    url: str | None | object = ...
+    if touch_url:
+        url = normalize_crdp_metrics_url(None if metrics_url is None else str(metrics_url))
+
+    alias: str | None | object = ...
+    if touch_name:
+        text = "" if display_name is None else str(display_name).strip()
+        alias = text or None
 
     def _do() -> dict[str, Any] | None:
         with connect() as conn:
-            cur = conn.execute(
-                """
-                UPDATE crdp_clients
-                SET metrics_url = ?, updated_at = ?,
-                    last_status = CASE
-                      WHEN ? IS NULL THEN last_status
-                      WHEN last_status = 'needs_host' THEN NULL
-                      ELSE last_status
-                    END,
-                    last_error = CASE WHEN ? IS NULL THEN last_error ELSE NULL END,
-                    fail_count = CASE WHEN ? IS NULL THEN fail_count ELSE 0 END
-                WHERE appliance_id = ? AND id = ?
-                """,
-                (url, now, url, url, url, appliance_id, client_pk),
-            )
-            if cur.rowcount <= 0:
-                return None
             row = conn.execute(
                 "SELECT * FROM crdp_clients WHERE appliance_id = ? AND id = ?",
                 (appliance_id, client_pk),
             ).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            sets: list[str] = ["updated_at = ?"]
+            params: list[Any] = [now]
+            if touch_name:
+                # If user typed the same as CM name, store NULL (no override).
+                cm_name = str(row["name"] or "").strip()
+                final_alias = None if (alias and str(alias).strip() == cm_name) else alias
+                sets.append("display_name = ?")
+                params.append(final_alias)
+            if touch_url:
+                if url is None:
+                    sets.extend(
+                        [
+                            "metrics_url = NULL",
+                            "last_status = 'needs_host'",
+                            "last_error = NULL",
+                            "fail_count = 0",
+                        ]
+                    )
+                else:
+                    sets.extend(
+                        [
+                            "metrics_url = ?",
+                            "last_status = CASE WHEN last_status = 'needs_host' THEN NULL ELSE last_status END",
+                            "last_error = NULL",
+                            "fail_count = 0",
+                        ]
+                    )
+                    params.append(url)
+            params.extend([appliance_id, client_pk])
+            conn.execute(
+                f"UPDATE crdp_clients SET {', '.join(sets)} WHERE appliance_id = ? AND id = ?",
+                params,
+            )
+            out = conn.execute(
+                "SELECT * FROM crdp_clients WHERE appliance_id = ? AND id = ?",
+                (appliance_id, client_pk),
+            ).fetchone()
+            return dict(out) if out else None
 
     return _retry_locked(_do)
+
+
+def crdp_display_label(row: dict[str, Any] | None) -> str:
+    """Friendly name if set, otherwise CM-registered name / id."""
+    if not row:
+        return ""
+    alias = str(row.get("display_name") or "").strip()
+    if alias:
+        return alias
+    return str(row.get("name") or row.get("cm_client_id") or "").strip()
 
 
 def update_crdp_scrape_status(
@@ -2065,7 +2128,9 @@ def sync_crdp_clients(
                     f"""
                     UPDATE crdp_clients
                     SET state = 'revoked', updated_at = ?,
-                        last_status = COALESCE(last_status, 'revoked')
+                        last_status = 'revoked',
+                        last_error = NULL,
+                        metrics_url = NULL
                     WHERE appliance_id = ?
                       AND cm_client_id IN ({placeholders})
                       AND state = 'active'
@@ -2099,6 +2164,91 @@ def sync_crdp_clients(
                 "removed_names": removed_names,
                 "needs_host": needs_host,
                 "active_count": len(new_ids),
+            }
+
+    return _retry_locked(_do)
+
+
+def delete_crdp_client(appliance_id: int, client_pk: int) -> bool:
+    """Permanently remove one tracked CRDP client row (usually revoked)."""
+    init_db()
+
+    def _do() -> bool:
+        with connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM crdp_clients WHERE appliance_id = ? AND id = ?",
+                (appliance_id, client_pk),
+            )
+            return cur.rowcount > 0
+
+    return bool(_retry_locked(_do))
+
+
+def delete_revoked_crdp_clients(appliance_id: int) -> int:
+    """Remove all non-active CRDP client rows for an appliance."""
+    init_db()
+
+    def _do() -> int:
+        with connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM crdp_clients
+                WHERE appliance_id = ?
+                  AND COALESCE(app_connector_type, '') = 'CRDP'
+                  AND state != 'active'
+                """,
+                (appliance_id,),
+            )
+            return int(cur.rowcount or 0)
+
+    return int(_retry_locked(_do) or 0)
+
+
+def purge_crdp_clients_absent_from_cm(
+    appliance_id: int,
+    cm_client_ids: set[str],
+) -> dict[str, Any]:
+    """Delete local CRDP rows whose CM id no longer exists on CipherTrust at all.
+
+    ``cm_client_ids`` must be the full set of data-protection client ids still
+    present on CM (any state). Callers must only invoke this after a successful
+    CM list — never with an empty set caused by an API failure.
+    """
+    init_db()
+    known = {str(x).strip() for x in cm_client_ids if str(x).strip()}
+
+    def _do() -> dict[str, Any]:
+        with connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, cm_client_id, name, display_name, state
+                FROM crdp_clients
+                WHERE appliance_id = ?
+                  AND COALESCE(app_connector_type, '') = 'CRDP'
+                """,
+                (appliance_id,),
+            ).fetchall()
+            gone = [
+                dict(r)
+                for r in rows
+                if str(r["cm_client_id"] or "").strip() not in known
+            ]
+            if not gone:
+                return {"purged": [], "purged_names": [], "count": 0}
+            ids = [int(r["id"]) for r in gone]
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"DELETE FROM crdp_clients WHERE id IN ({placeholders})",
+                ids,
+            )
+            names = [
+                str(r.get("display_name") or r.get("name") or r.get("cm_client_id") or "")
+                for r in gone
+            ]
+            return {
+                "purged": [str(r.get("cm_client_id") or "") for r in gone],
+                "purged_names": names,
+                "count": len(gone),
             }
 
     return _retry_locked(_do)

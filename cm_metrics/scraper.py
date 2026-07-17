@@ -635,15 +635,19 @@ class MetricsScraper:
         appliance: dict[str, Any],
         client: CMClient,
     ) -> None:
-        """Discover active CRDP clients on CM; notify on membership changes."""
+        """Discover active CRDP clients on CM; notify on membership changes.
+
+        Also auto-purges local rows for clients that no longer exist on CM at all
+        (deleted from CM, not merely revoked).
+        """
         try:
-            raw = client.list_data_protection_clients(state="active", limit=100)
+            raw_active = client.list_data_protection_clients(state="active", limit=100)
         except CMClientError as exc:
             logger.info("CRDP client list skipped for appliance %s: %s", appliance_id, exc)
             return
         active_crdp = [
             r
-            for r in raw
+            for r in raw_active
             if str(r.get("app_connector_type") or "").strip() == "CRDP"
             and str(r.get("state") or "").lower() == "active"
         ]
@@ -653,9 +657,65 @@ class MetricsScraper:
             logger.exception("CRDP sync failed for appliance %s", appliance_id)
             return
 
+        # Full CM membership (any state) — used to drop local rows deleted on CM.
+        purge_info: dict[str, Any] = {"purged": [], "purged_names": [], "count": 0}
+        try:
+            raw_all = client.list_data_protection_clients(state=None, limit=100, max_pages=50)
+            # Also pull revoked explicitly in case unfiltered list is truncated/filtered.
+            try:
+                raw_revoked = client.list_data_protection_clients(
+                    state="revoked", limit=100, max_pages=50
+                )
+            except CMClientError:
+                raw_revoked = []
+            known_ids = {
+                str(r.get("id") or "").strip()
+                for r in (raw_all + raw_revoked + raw_active)
+                if str(r.get("id") or "").strip()
+            }
+            # Only purge when we successfully built a CM id set (may be empty if CM
+            # truly has zero clients — that correctly clears local tracking).
+            purge_info = db.purge_crdp_clients_absent_from_cm(appliance_id, known_ids)
+            if purge_info.get("count"):
+                # Drop live gauges for purged clients immediately.
+                try:
+                    store = self.store.for_appliance(appliance_id, hydrate=False)
+                    remaining = {
+                        str(c.get("cm_client_id") or "")
+                        for c in db.list_crdp_clients(appliance_id, active_only=True)
+                        if (c.get("metrics_url") or "").strip()
+                    }
+                    if remaining:
+                        store.prune_job(
+                            "crdp", keep_label="crdp_client_id", keep_values=remaining
+                        )
+                    else:
+                        # No configured scrapes left — clear CRDP snapshot series.
+                        still_any = db.list_crdp_clients(appliance_id, active_only=True)
+                        configured = [
+                            c for c in still_any if (c.get("metrics_url") or "").strip()
+                        ]
+                        if not configured:
+                            store.drop_job("crdp")
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Could not prune CRDP metrics after purge appliance=%s",
+                        appliance_id,
+                        exc_info=True,
+                    )
+        except CMClientError as exc:
+            logger.info(
+                "CRDP full client list skipped for appliance %s (no auto-purge): %s",
+                appliance_id,
+                exc,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("CRDP auto-purge failed for appliance %s", appliance_id)
+
         added = diff.get("added") or []
         removed = diff.get("removed") or []
-        if not added and not removed:
+        purged = purge_info.get("purged") or []
+        if not added and not removed and not purged:
             return
 
         name = appliance.get("display_name") or appliance.get("host") or f"#{appliance_id}"
@@ -671,6 +731,14 @@ class MetricsScraper:
             more = f" (+{extra} more)" if extra > 0 else ""
             parts.append(
                 f"{len(removed)} CRDP client(s) no longer active"
+                f"{': ' + sample if sample else ''}{more}"
+            )
+        if purged:
+            sample = ", ".join(str(n) for n in (purge_info.get("purged_names") or [])[:3])
+            extra = len(purged) - min(3, len(purged))
+            more = f" (+{extra} more)" if extra > 0 else ""
+            parts.append(
+                f"{len(purged)} CRDP client(s) removed from CM (purged locally)"
                 f"{': ' + sample if sample else ''}{more}"
             )
         needs = diff.get("needs_host") or []
@@ -700,15 +768,18 @@ class MetricsScraper:
             if str(c.get("app_connector_type") or "") == "CRDP"
             and (c.get("metrics_url") or "").strip()
         ]
-        if not clients:
-            return
         store = self.store.for_appliance(appliance_id, hydrate=False)
+        if not clients:
+            # No configured hosts — clear any leftover CRDP gauges from the snapshot.
+            store.drop_job("crdp")
+            return
+        configured_ids = {str(c.get("cm_client_id") or "") for c in clients}
         for row in clients:
             url = (row.get("metrics_url") or "").strip()
             pk = int(row["id"])
             labels = {
                 "crdp_client_id": str(row.get("cm_client_id") or ""),
-                "crdp_app_name": str(row.get("name") or ""),
+                "crdp_app_name": db.crdp_display_label(row),
                 "job": "crdp",
             }
             try:
@@ -732,6 +803,9 @@ class MetricsScraper:
                     exc,
                 )
                 db.update_crdp_scrape_status(pk, ok=False, error=str(exc), status="error")
+        # Drop CRDP series for clients that are no longer configured (keep last-good
+        # values for hosts that failed this round).
+        store.prune_job("crdp", keep_label="crdp_client_id", keep_values=configured_ids)
 
     def _appliance_scrape_lock(self, appliance_id: int) -> threading.Lock:
         with self._lock:

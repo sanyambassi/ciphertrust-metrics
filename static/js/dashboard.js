@@ -16,7 +16,13 @@ import {
 } from "./format.js";
 import { chartColors, cssVar } from "./theme.js";
 import { fetchJSON, refreshStatus } from "./api.js";
-import { loadAppliances, renderApplianceTree, openModal, renderFleetHealth } from "./appliances.js";
+import {
+  loadAppliances,
+  renderApplianceTree,
+  renderApplianceList,
+  openModal,
+  renderFleetHealth,
+} from "./appliances.js";
 
 function chartXBounds() {
   const secs = RANGE_OPTIONS.find((r) => r.id === state.rangeId)?.seconds || 86400;
@@ -458,19 +464,31 @@ function renderCrdpClients(panel, animate) {
   el.dataset.panelTitle = panel.title;
   el.dataset.panelType = "crdp_clients";
   const rows = panel.rows || [];
+  const revokedCount = Number(panel.revoked_count || 0);
   const desc = panel.description
     ? `<div class="stat-desc">${escapeHtml(panel.description)}</div>`
     : "";
+  const clearRevokedBtn =
+    revokedCount > 0
+      ? `<button type="button" class="btn btn-sm crdp-clear-revoked" title="Delete all revoked rows from local DB">Clear revoked (${revokedCount})</button>`
+      : "";
   if (!rows.length) {
     el.innerHTML = `
-      <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+      <div class="crdp-panel-head">
+        <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+        ${clearRevokedBtn}
+      </div>
       ${desc}
       <div class="empty">No CRDP clients discovered yet.</div>
     `;
+    bindCrdpClientActions(el);
     return el;
   }
   el.innerHTML = `
-    <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+    <div class="crdp-panel-head">
+      <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+      ${clearRevokedBtn}
+    </div>
     ${desc}
     <div class="table-wrap">
       <table class="data crdp-table">
@@ -490,32 +508,49 @@ function renderCrdpClients(panel, animate) {
             .map((r) => {
               const id = Number(r.id);
               const active = String(r.state || "") === "active";
-              const urlEmpty = !String(r.metrics_url || "").trim();
+              const cmName = String(r.name || r.cm_client_id || "");
+              const savedLabel = String(r.display_name || "").trim() || cmName;
+              const renamed = Boolean(String(r.display_name || "").trim());
+              const savedUrl = String(r.metrics_url || "");
+              const urlEmpty = !savedUrl.trim();
               const urlClass = [
                 "crdp-url-input",
                 active && urlEmpty ? "crdp-url-empty" : "",
               ]
                 .filter(Boolean)
                 .join(" ");
+              const actions = active
+                ? `<button type="button" class="btn btn-sm crdp-save" data-id="${id}" disabled>Save</button>
+                   <button type="button" class="btn btn-sm crdp-clear-url" data-id="${id}" ${
+                     urlEmpty ? "disabled" : ""
+                   } title="Clear metrics URL">Clear</button>`
+                : `<button type="button" class="btn btn-sm btn-danger crdp-remove" data-id="${id}" title="Delete from local tracking">Remove</button>`;
+              const idHint = renamed
+                ? `<span class="crdp-cm-id" title="CM client id">${escapeHtml(cmName)}</span>`
+                : `<span class="crdp-cm-id is-hidden" title="CM client id">${escapeHtml(cmName)}</span>`;
               return `<tr data-crdp-id="${id}" class="${active ? "" : "crdp-revoked"}">
-                <td>${escapeHtml(String(r.name || ""))}</td>
+                <td class="crdp-name-cell">
+                  <input type="text" class="crdp-name-input" ${active ? "" : "disabled"}
+                    data-cm-name="${escapeHtml(cmName)}"
+                    data-saved-name="${escapeHtml(savedLabel)}"
+                    value="${escapeHtml(savedLabel)}"
+                    placeholder="Friendly name" />
+                  ${idHint}
+                </td>
                 <td>${escapeHtml(String(r.state || ""))}</td>
                 <td>${escapeHtml(String(r.connectivity || ""))}</td>
                 <td class="mono">${escapeHtml(String(r.version || ""))}</td>
                 <td>
                   <input type="text" class="${urlClass}" ${active ? "" : "disabled"}
-                    value="${escapeHtml(String(r.metrics_url || ""))}"
+                    data-saved-url="${escapeHtml(savedUrl)}"
+                    value="${escapeHtml(savedUrl)}"
                     placeholder="http://host:8080 or https://host"
                     aria-invalid="${active && urlEmpty ? "true" : "false"}" />
                 </td>
                 <td class="mono">${escapeHtml(String(r.scrape || ""))}${
                   r.error ? `<div class="crdp-err">${escapeHtml(String(r.error))}</div>` : ""
                 }</td>
-                <td>${
-                  active
-                    ? `<button type="button" class="btn btn-sm crdp-save" data-id="${id}">Save</button>`
-                    : ""
-                }</td>
+                <td class="crdp-actions">${actions}</td>
               </tr>`;
             })
             .join("")}
@@ -523,49 +558,175 @@ function renderCrdpClients(panel, animate) {
       </table>
     </div>
   `;
-  const syncUrlHighlight = (input) => {
-    if (!input || input.disabled) return;
-    const empty = !String(input.value || "").trim();
-    input.classList.toggle("crdp-url-empty", empty);
-    input.setAttribute("aria-invalid", empty ? "true" : "false");
-  };
-  el.querySelectorAll(".crdp-url-input").forEach((input) => {
-    input.addEventListener("input", () => syncUrlHighlight(input));
-    input.addEventListener("change", () => syncUrlHighlight(input));
+  el.querySelectorAll("tr[data-crdp-id]").forEach((tr) => {
+    syncCrdpUrlRow(tr);
+    tr.querySelectorAll(".crdp-url-input, .crdp-name-input").forEach((input) => {
+      input.addEventListener("input", () => syncCrdpUrlRow(tr));
+      input.addEventListener("change", () => syncCrdpUrlRow(tr));
+    });
   });
+  bindCrdpClientActions(el);
+  return el;
+}
+
+/** Enable Save when name or URL differs from saved; Clear when a URL exists. */
+function syncCrdpUrlRow(row) {
+  if (!row) return;
+  const urlInput = row.querySelector(".crdp-url-input");
+  const nameInput = row.querySelector(".crdp-name-input");
+  const saveBtn = row.querySelector(".crdp-save");
+  const clearBtn = row.querySelector(".crdp-clear-url");
+  const idHint = row.querySelector(".crdp-cm-id");
+
+  let urlDirty = false;
+  if (urlInput && !urlInput.disabled) {
+    const saved = String(urlInput.dataset.savedUrl || "");
+    const current = String(urlInput.value || "").trim();
+    urlDirty = current !== saved.trim();
+    urlInput.dataset.dirty = urlDirty ? "1" : "0";
+    const empty = !current;
+    urlInput.classList.toggle("crdp-url-empty", empty);
+    urlInput.setAttribute("aria-invalid", empty ? "true" : "false");
+    if (clearBtn) clearBtn.disabled = empty && !saved.trim();
+  }
+
+  let nameDirty = false;
+  if (nameInput && !nameInput.disabled) {
+    const savedName = String(nameInput.dataset.savedName || "");
+    const currentName = String(nameInput.value || "").trim();
+    const cmName = String(nameInput.dataset.cmName || "").trim();
+    nameDirty = currentName !== savedName.trim();
+    nameInput.dataset.dirty = nameDirty ? "1" : "0";
+    // Show CM id next to friendly name when renamed (saved or typed away from CM name).
+    const showId = Boolean(currentName) && currentName !== cmName;
+    if (idHint) idHint.classList.toggle("is-hidden", !showId);
+  }
+
+  if (saveBtn) saveBtn.disabled = !(urlDirty || nameDirty);
+}
+
+function bindCrdpClientActions(el) {
   el.addEventListener("click", async (ev) => {
+    const clearRevokedBtn = ev.target.closest(".crdp-clear-revoked");
+    if (clearRevokedBtn) {
+      if (!state.applianceId) return;
+      if (!window.confirm("Remove all revoked CRDP clients from local tracking?")) return;
+      clearRevokedBtn.disabled = true;
+      try {
+        await fetchJSON(
+          `/api/appliances/${state.applianceId}/crdp/clients?state=revoked`,
+          { method: "DELETE" }
+        );
+        await loadDashboard("crdp", { forceFull: false });
+      } catch (err) {
+        window.alert(err?.message || String(err));
+        clearRevokedBtn.disabled = false;
+      }
+      return;
+    }
+
+    const removeBtn = ev.target.closest(".crdp-remove");
+    if (removeBtn) {
+      const clientId = Number(removeBtn.dataset.id);
+      if (!clientId || !state.applianceId) return;
+      removeBtn.disabled = true;
+      try {
+        await fetchJSON(
+          `/api/appliances/${state.applianceId}/crdp/clients/${clientId}`,
+          { method: "DELETE" }
+        );
+        el.querySelector(`tr[data-crdp-id="${clientId}"]`)?.remove();
+        await loadDashboard("crdp", { forceFull: false });
+      } catch (err) {
+        removeBtn.disabled = false;
+        window.alert(err?.message || String(err));
+      }
+      return;
+    }
+
+    const clearUrlBtn = ev.target.closest(".crdp-clear-url");
+    if (clearUrlBtn) {
+      const clientId = Number(clearUrlBtn.dataset.id);
+      const row = el.querySelector(`tr[data-crdp-id="${clientId}"]`);
+      const input = row?.querySelector(".crdp-url-input");
+      if (!clientId || !input || !state.applianceId) return;
+      const hadSaved = Boolean(String(input.dataset.savedUrl || "").trim());
+      input.value = "";
+      syncCrdpUrlRow(row);
+      if (!hadSaved) return;
+      clearUrlBtn.disabled = true;
+      try {
+        await fetchJSON(`/api/appliances/${state.applianceId}/crdp/clients/${clientId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ metrics_url: "" }),
+        });
+        input.dataset.savedUrl = "";
+        input.dataset.dirty = "0";
+        syncCrdpUrlRow(row);
+        await loadDashboard("crdp", { forceFull: false });
+      } catch (err) {
+        window.alert(err?.message || String(err));
+        clearUrlBtn.disabled = false;
+      }
+      return;
+    }
+
     const btn = ev.target.closest(".crdp-save");
-    if (!btn) return;
+    if (!btn || btn.disabled) return;
     const clientId = Number(btn.dataset.id);
     const row = el.querySelector(`tr[data-crdp-id="${clientId}"]`);
-    const input = row?.querySelector(".crdp-url-input");
-    if (!clientId || !input || !state.applianceId) return;
+    const urlInput = row?.querySelector(".crdp-url-input");
+    const nameInput = row?.querySelector(".crdp-name-input");
+    if (!clientId || !state.applianceId) return;
     btn.disabled = true;
     const prev = btn.textContent;
     btn.textContent = "Saving…";
+    const body = {};
+    if (urlInput && urlInput.dataset.dirty === "1") {
+      body.metrics_url = urlInput.value || "";
+    }
+    if (nameInput && nameInput.dataset.dirty === "1") {
+      body.display_name = nameInput.value || "";
+    }
     try {
-      await fetchJSON(`/api/appliances/${state.applianceId}/crdp/clients/${clientId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ metrics_url: input.value || "" }),
-      });
+      const updated = await fetchJSON(
+        `/api/appliances/${state.applianceId}/crdp/clients/${clientId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }
+      );
+      if (urlInput) {
+        urlInput.dataset.savedUrl = String(updated?.metrics_url || urlInput.value || "").trim();
+        urlInput.value = urlInput.dataset.savedUrl;
+        urlInput.dataset.dirty = "0";
+      }
+      if (nameInput) {
+        const cmName = String(nameInput.dataset.cmName || "");
+        const alias = String(updated?.display_name || "").trim();
+        const label = alias || cmName;
+        nameInput.dataset.savedName = label;
+        nameInput.value = label;
+        nameInput.dataset.dirty = "0";
+      }
       btn.textContent = "Saved";
+      syncCrdpUrlRow(row);
       window.setTimeout(() => {
         btn.textContent = prev || "Save";
-        btn.disabled = false;
+        syncCrdpUrlRow(row);
       }, 900);
-      // Refresh dashboard to pick up scrape status / charts.
-      loadDashboard("crdp", { forceFull: true }).catch(() => null);
+      loadDashboard("crdp", { forceFull: false }).catch(() => null);
     } catch (err) {
       btn.textContent = "Error";
-      btn.disabled = false;
       window.alert(err?.message || String(err));
       window.setTimeout(() => {
         btn.textContent = prev || "Save";
+        syncCrdpUrlRow(row);
       }, 1200);
     }
   });
-  return el;
 }
 
 /** Jump to Connectors → CRDP for a given appliance (notification deep-link). */
@@ -579,8 +740,11 @@ export async function openCrdpForAppliance(applianceId) {
   persistTabChip("cloud", "crdp");
   state.groupId = "cloud";
   state.dashboardId = "crdp";
+  // Keep the header dropdown / status pill in sync with the deep-linked appliance.
+  renderApplianceList(true);
   syncWorkspaceChrome();
   await loadDashboard("crdp", { forceFull: true });
+  await refreshStatus().catch(() => null);
 }
 
 export function fullRender(data, animate = true) {
@@ -728,8 +892,10 @@ export function updateInPlace(data) {
     }
 
     if (panel.type === "crdp_clients") {
-      // Inputs hold local edits — always full-render this panel.
-      return false;
+      // Rebuild only this panel when needed — never fail the whole dashboard
+      // update (that destroys charts and flashes stats).
+      updateCrdpClientsInPlace(panel);
+      continue;
     }
 
     if (panel.type === "note") {
@@ -742,14 +908,124 @@ export function updateInPlace(data) {
   return true;
 }
 
+/** Keep CRDP clients table in sync without tearing down other panels. */
+function updateCrdpClientsInPlace(panel) {
+  const { panelsEl } = getDom();
+  const root = panelsEl?.querySelector(
+    `.panel.crdp-clients[data-panel-title="${CSS.escape(panel.title)}"]`
+  );
+  if (!root) {
+    // Panel missing — let caller soft-rebuild only if layout sig changed.
+    return false;
+  }
+  const rows = panel.rows || [];
+  const tbody = root.querySelector("tbody");
+  if (!tbody) {
+    if (rows.length === 0) return true;
+    root.replaceWith(renderCrdpClients(panel, false));
+    return true;
+  }
+  const byId = new Map(rows.map((r) => [String(r.id), r]));
+  const existing = [...tbody.querySelectorAll("tr[data-crdp-id]")];
+  const existingIds = new Set(existing.map((tr) => tr.getAttribute("data-crdp-id")));
+  const nextIds = new Set(rows.map((r) => String(r.id)));
+  // Row set changed — swap only this panel (preserve charts/stats).
+  if (
+    existingIds.size !== nextIds.size ||
+    [...nextIds].some((id) => !existingIds.has(id))
+  ) {
+    root.replaceWith(renderCrdpClients(panel, false));
+    return true;
+  }
+  for (const tr of existing) {
+    const id = tr.getAttribute("data-crdp-id");
+    const r = byId.get(id);
+    if (!r) {
+      root.replaceWith(renderCrdpClients(panel, false));
+      return true;
+    }
+    const active = String(r.state || "") === "active";
+    tr.classList.toggle("crdp-revoked", !active);
+    const cells = tr.children;
+    if (cells.length < 6) {
+      root.replaceWith(renderCrdpClients(panel, false));
+      return true;
+    }
+    cells[0].textContent = String(r.name || "");
+    cells[1].textContent = String(r.state || "");
+    cells[2].textContent = String(r.connectivity || "");
+    cells[3].textContent = String(r.version || "");
+    const nameInput = cells[0]?.querySelector(".crdp-name-input");
+    if (nameInput) {
+      const cmName = String(r.name || r.cm_client_id || "");
+      const alias = String(r.display_name || "").trim();
+      const label = alias || cmName;
+      const focused = document.activeElement === nameInput;
+      const dirty = focused || nameInput.dataset.dirty === "1";
+      nameInput.dataset.cmName = cmName;
+      if (!dirty) {
+        nameInput.value = label;
+        nameInput.dataset.savedName = label;
+      }
+      nameInput.disabled = !active;
+      const idHint = cells[0]?.querySelector(".crdp-cm-id");
+      if (idHint) {
+        idHint.textContent = cmName;
+        idHint.classList.toggle(
+          "is-hidden",
+          !(String(nameInput.value || "").trim() && String(nameInput.value || "").trim() !== cmName)
+        );
+      }
+    }
+    const input = cells[4]?.querySelector(".crdp-url-input");
+    if (input) {
+      const serverUrl = String(r.metrics_url || "");
+      const focused = document.activeElement === input;
+      const dirty = focused || input.dataset.dirty === "1";
+      if (!dirty && input.value !== serverUrl) {
+        input.value = serverUrl;
+        input.dataset.savedUrl = serverUrl;
+      }
+      if (!dirty) input.dataset.savedUrl = serverUrl;
+      input.disabled = !active;
+    }
+    syncCrdpUrlRow(tr);
+    // Refresh action buttons if active/revoked flipped
+    const actions = cells[6];
+    if (actions && active && !actions.querySelector(".crdp-save")) {
+      root.replaceWith(renderCrdpClients(panel, false));
+      return true;
+    }
+    if (actions && !active && !actions.querySelector(".crdp-remove")) {
+      root.replaceWith(renderCrdpClients(panel, false));
+      return true;
+    }
+    const scrapeCell = cells[5];
+    const scrapeText = String(r.scrape || "");
+    const err = r.error ? String(r.error) : "";
+    scrapeCell.className = "mono";
+    scrapeCell.innerHTML =
+      escapeHtml(scrapeText) +
+      (err ? `<div class="crdp-err">${escapeHtml(err)}</div>` : "");
+  }
+  return true;
+}
+
 export function applyDashboard(data, forceFull = false) {
   try {
     const sig = panelSignature(data);
     // Prefer in-place updates on Auto refresh — including table/stat-only boards
     // that have zero Chart.js instances (old charts.length check forced a flash).
-    if (!forceFull && state.panelMeta === sig) {
-      if (updateInPlace(data)) return;
-      // Charts/DOM missing after a partial destroy — fall through to full render.
+    if (!forceFull && state.panelMeta) {
+      if (state.panelMeta === sig) {
+        if (updateInPlace(data)) return;
+        // Charts/DOM missing after a partial destroy — soft rebuild, no spinner.
+        fullRender(data, false);
+        return;
+      }
+      // Layout changed (note/chart appeared) — soft rebuild without enter animation.
+      fullRender(data, false);
+      return;
     }
     fullRender(data, Boolean(forceFull || !state.panelMeta));
   } catch (err) {
@@ -798,7 +1074,7 @@ export function showDashboardLoading(id) {
     </div>`;
 }
 
-export async function loadDashboard(id, { forceFull = false } = {}) {
+export async function loadDashboard(id, { forceFull = false, showLoading = null } = {}) {
   const { panelsEl } = getDom();
   if (state.viewMode === "appliances") return;
   if (state.viewMode === "healthcheck") return;
@@ -806,8 +1082,10 @@ export async function loadDashboard(id, { forceFull = false } = {}) {
   state.dashboardId = id;
   state.groupId = groupForDashboard(id);
   syncTabChrome();
-  // Tab / range switches: drop old panels right away (don't wait for the API).
-  if (forceFull) {
+  // Only show the loading wipe on intentional tab/appliance switches — never on
+  // Auto refresh / soft polls (that flash zeros and re-animate the page).
+  const wipe = showLoading != null ? Boolean(showLoading) : Boolean(forceFull);
+  if (wipe) {
     showDashboardLoading(id);
   }
   if (!state.applianceId) {

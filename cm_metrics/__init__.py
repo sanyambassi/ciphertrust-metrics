@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from flask import Flask, jsonify, render_template, request
 
@@ -220,22 +221,63 @@ def create_app() -> Flask:
         if not db.get_appliance(appliance_id):
             return jsonify({"error": "not found"}), 404
         payload = request.get_json(silent=True) or {}
-        if "metrics_url" not in payload:
-            return jsonify({"error": "metrics_url is required"}), 400
-        try:
-            updated = db.update_crdp_metrics_url(
-                appliance_id, client_id, str(payload.get("metrics_url") or "")
+        has_url = "metrics_url" in payload
+        has_name = "display_name" in payload or "name" in payload
+        if not has_url and not has_name:
+            return jsonify({"error": "metrics_url or display_name is required"}), 400
+        kwargs: dict[str, Any] = {}
+        if has_url:
+            kwargs["metrics_url"] = str(payload.get("metrics_url") or "")
+        if has_name:
+            kwargs["display_name"] = str(
+                payload.get("display_name")
+                if "display_name" in payload
+                else payload.get("name")
+                or ""
             )
+        try:
+            updated = db.update_crdp_client(appliance_id, client_id, **kwargs)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         if not updated:
             return jsonify({"error": "not found"}), 404
-        # Opportunistic scrape of this host after save.
-        try:
-            scraper._scrape_crdp_metrics(appliance_id)  # noqa: SLF001
-        except Exception:  # noqa: BLE001
-            pass
+        # Opportunistic scrape after URL save (name-only skips scrape).
+        if has_url and (updated.get("metrics_url") or "").strip():
+            try:
+                scraper._scrape_crdp_metrics(appliance_id)  # noqa: SLF001
+            except Exception:  # noqa: BLE001
+                pass
         return jsonify(updated)
+
+    @app.delete("/api/appliances/<int:appliance_id>/crdp/clients/<int:client_id>")
+    def api_delete_crdp_client(appliance_id: int, client_id: int):
+        if not db.get_appliance(appliance_id):
+            return jsonify({"error": "not found"}), 404
+        row = db.get_crdp_client(appliance_id, client_id)
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        if str(row.get("state") or "").lower() == "active":
+            return jsonify(
+                {
+                    "error": "Active CRDP clients are managed by CipherTrust Manager. "
+                    "Revoke/remove them on CM first; then you can delete the local row."
+                }
+            ), 400
+        ok = db.delete_crdp_client(appliance_id, client_id)
+        if not ok:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"ok": True, "deleted": client_id})
+
+    @app.delete("/api/appliances/<int:appliance_id>/crdp/clients")
+    def api_delete_revoked_crdp_clients(appliance_id: int):
+        """Clear all locally tracked revoked CRDP clients for this appliance."""
+        if not db.get_appliance(appliance_id):
+            return jsonify({"error": "not found"}), 404
+        scope = str(request.args.get("state") or "revoked").lower()
+        if scope not in {"revoked", "inactive", "all_inactive"}:
+            return jsonify({"error": "use ?state=revoked"}), 400
+        n = db.delete_revoked_crdp_clients(appliance_id)
+        return jsonify({"ok": True, "deleted": n})
 
     # ---- Healthcheck ----------------------------------------------------
 

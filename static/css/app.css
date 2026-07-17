@@ -1061,6 +1061,60 @@ code {
   flex-shrink: 0;
 }
 
+.crdp-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.crdp-panel-head .panel-title {
+  margin-bottom: 0;
+}
+
+.crdp-table .crdp-name-cell {
+  min-width: 200px;
+  max-width: 320px;
+}
+
+.crdp-table .crdp-name-input {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.crdp-table .crdp-cm-id {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.crdp-table .crdp-cm-id.is-hidden {
+  display: none;
+}
+
+.crdp-table .crdp-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+
+.crdp-table .crdp-actions .btn {
+  margin-left: 4px;
+}
+
+.crdp-table .crdp-actions .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .crdp-table .crdp-url-input {
   width: min(280px, 100%);
   padding: 6px 8px;

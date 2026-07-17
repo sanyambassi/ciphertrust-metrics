@@ -142,16 +142,26 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
 
     rows = []
     for c in active + revoked[:20]:
+        has_url = bool(str(c.get("metrics_url") or "").strip())
+        if has_url:
+            scrape = c.get("last_status") or ""
+            error = (c.get("last_error") or "")[:120]
+        else:
+            scrape = "needs_host"
+            error = ""
         rows.append(
             {
                 "id": c.get("id"),
                 "name": c.get("name") or c.get("cm_client_id") or "",
+                "display_name": c.get("display_name") or "",
+                "cm_client_id": c.get("cm_client_id") or "",
+                "label": db.crdp_display_label(c),
                 "state": c.get("state") or "",
                 "connectivity": c.get("connectivity_status") or "",
                 "version": c.get("app_connector_version") or "",
                 "metrics_url": c.get("metrics_url") or "",
-                "scrape": c.get("last_status") or ("needs_host" if not c.get("metrics_url") else ""),
-                "error": (c.get("last_error") or "")[:120],
+                "scrape": scrape,
+                "error": error,
             }
         )
 
@@ -159,10 +169,10 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
         {
             "type": "crdp_clients",
             "title": "CRDP Clients",
-            "description": "Active CRDP only is scraped. Set Metrics URL to http://host:8080 or https://host.",
             "wide": True,
             "span": 12,
             "rows": rows,
+            "revoked_count": counts.get("revoked") or 0,
         }
     )
 
@@ -171,12 +181,23 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
     reveal_ok = _sum_metric(store, "reveal_success_count")
     reveal_fail = _sum_metric(store, "reveal_failure_count")
     bulk_protect_ok = _sum_metric(store, "protect_bulk_success_count")
+    bulk_protect_fail = _sum_metric(store, "protect_bulk_failure_count")
     bulk_reveal_ok = _sum_metric(store, "reveal_bulk_success_count")
+    bulk_reveal_fail = _sum_metric(store, "reveal_bulk_failure_count")
     unique_ips = _sum_metric(store, "unique_ip_address_count")
 
     has_perf = any(
         v is not None
-        for v in (protect_ok, protect_fail, reveal_ok, reveal_fail, bulk_protect_ok, bulk_reveal_ok)
+        for v in (
+            protect_ok,
+            protect_fail,
+            reveal_ok,
+            reveal_fail,
+            bulk_protect_ok,
+            bulk_protect_fail,
+            bulk_reveal_ok,
+            bulk_reveal_fail,
+        )
     )
 
     panels.extend(
@@ -186,7 +207,17 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
             _stat("Reveal OK", reveal_ok if has_perf else None),
             _stat("Reveal Fail", reveal_fail if has_perf else None, tone="fail" if (reveal_fail or 0) > 0 else ""),
             _stat("Bulk Protect OK", bulk_protect_ok if has_perf else None),
+            _stat(
+                "Bulk Protect Fail",
+                bulk_protect_fail if has_perf else None,
+                tone="fail" if (bulk_protect_fail or 0) > 0 else "",
+            ),
             _stat("Bulk Reveal OK", bulk_reveal_ok if has_perf else None),
+            _stat(
+                "Bulk Reveal Fail",
+                bulk_reveal_fail if has_perf else None,
+                tone="fail" if (bulk_reveal_fail or 0) > 0 else "",
+            ),
             _stat("Unique IPs", unique_ips if has_perf else None),
         ]
     )
@@ -230,6 +261,42 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
                         label_keys=["crdp_app_name"],
                     ),
                 ),
+                _timeseries(
+                    "Bulk Protect Success /s",
+                    _named_series(
+                        store,
+                        "protect_bulk_success_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _timeseries(
+                    "Bulk Reveal Success /s",
+                    _named_series(
+                        store,
+                        "reveal_bulk_success_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _timeseries(
+                    "Bulk Protect Failures /s",
+                    _named_series(
+                        store,
+                        "protect_bulk_failure_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
+                _timeseries(
+                    "Bulk Reveal Failures /s",
+                    _named_series(
+                        store,
+                        "reveal_bulk_failure_count",
+                        rate=True,
+                        label_keys=["crdp_app_name"],
+                    ),
+                ),
                 _bar(
                     "Protect Success by App",
                     store.group_by_label("protect_success_count", "crdp_app_name"),
@@ -237,6 +304,14 @@ def build_crdp(store: ApplianceStore, appliance: dict[str, Any] | None = None) -
                 _bar(
                     "Reveal Success by App",
                     store.group_by_label("reveal_success_count", "crdp_app_name"),
+                ),
+                _bar(
+                    "Bulk Protect by App",
+                    store.group_by_label("protect_bulk_success_count", "crdp_app_name"),
+                ),
+                _bar(
+                    "Bulk Reveal by App",
+                    store.group_by_label("reveal_bulk_success_count", "crdp_app_name"),
                 ),
             ]
         )

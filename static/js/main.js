@@ -40,7 +40,7 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js";
+} from "./dashboard.js?v=20260717crdpname1";
 
 const dom = getDom();
 const {
@@ -283,8 +283,8 @@ async function pollForceRefreshUntilDone() {
           refreshPollTimer = null;
         }
         setRefreshButtonBusy(false);
-        // Final full paint so badges/uptime settle.
-        await tick({ forceFull: true, scrape: false }).catch(() => null);
+        // Soft final paint — forceFull would wipe panels and flash the page.
+        await tick({ forceFull: false, scrape: false }).catch(() => null);
         return true;
       }
     } catch (err) {
