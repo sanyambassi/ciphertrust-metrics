@@ -104,6 +104,8 @@ def create_app() -> Flask:
                     "then re-add it with a user that can read the metrics token."
                 )
             return jsonify(body), 400
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         except Exception as exc:  # noqa: BLE001
             logger.exception("Add appliance unexpected error")
             return jsonify({"error": str(exc)}), 500

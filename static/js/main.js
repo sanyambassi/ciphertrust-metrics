@@ -193,6 +193,37 @@ editForm?.addEventListener("submit", (e) => {
   submitEditForm(e);
 });
 
+/** Build https://host[:port] for CM connect. Empty port → default 443. */
+function buildCmHost(rawHost, rawPort) {
+  let host = String(rawHost || "").trim();
+  if (!host) return "";
+  const portStr = String(rawPort ?? "").trim();
+  if (portStr) {
+    const port = Number(portStr);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("HTTPS port must be an integer between 1 and 65535.");
+    }
+    // If the host already includes a port (or full URL), replace/keep via URL parse.
+    const withScheme = host.includes("://") ? host : `https://${host}`;
+    try {
+      const u = new URL(withScheme);
+      if (port === 443) {
+        u.port = "";
+      } else {
+        u.port = String(port);
+      }
+      // Prefer https for CM unless user explicitly typed http://
+      if (!host.includes("://")) {
+        u.protocol = "https:";
+      }
+      host = u.toString().replace(/\/$/, "");
+    } catch {
+      throw new Error("Invalid IP / hostname / URL.");
+    }
+  }
+  return host;
+}
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   formError.hidden = true;
@@ -204,8 +235,19 @@ form.addEventListener("submit", async (e) => {
     }
   }, 12000);
   const fd = new FormData(form);
+  let host;
+  try {
+    host = buildCmHost(fd.get("host"), fd.get("port"));
+  } catch (err) {
+    window.clearTimeout(stillHint);
+    btnConnect.disabled = false;
+    btnConnect.textContent = "Connect";
+    formError.hidden = false;
+    formError.textContent = err.message || String(err);
+    return;
+  }
   const body = {
-    host: fd.get("host"),
+    host,
     username: fd.get("username"),
     password: fd.get("password"),
     display_name: fd.get("display_name") || undefined,

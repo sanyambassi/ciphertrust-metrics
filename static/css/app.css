@@ -1769,8 +1769,20 @@ code {
   opacity: 0.7;
 }
 
+.modal .host-port-row {
+  display: grid;
+  grid-template-columns: 1fr 7.5rem;
+  gap: 10px;
+  align-items: end;
+}
+
+.modal .port-field input {
+  width: 100%;
+}
+
 .modal input[type="text"],
 .modal input[type="password"],
+.modal input[type="number"],
 .modal input:not([type]) {
   border: 1px solid var(--border);
   background: var(--bg);
@@ -1780,6 +1792,12 @@ code {
   font: inherit;
   font-size: 14px;
   font-weight: 400;
+}
+
+@media (max-width: 520px) {
+  .modal .host-port-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .modal input:focus {

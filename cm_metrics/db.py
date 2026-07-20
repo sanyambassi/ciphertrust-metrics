@@ -437,12 +437,26 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 def normalize_host(host: str) -> str:
-    host = host.strip()
+    """Normalize CM host to a scheme://host[:port] URL.
+
+    Bare ``cm.example.com`` → ``https://cm.example.com`` (port 443 implied).
+    ``cm.example.com:8443`` / ``https://cm.example.com:8443`` keep the custom HTTPS port.
+    """
+    from urllib.parse import urlparse
+
+    host = (host or "").strip()
     if not host:
         raise ValueError("host is required")
     if "://" not in host:
         host = f"https://{host}"
-    return host.rstrip("/")
+    host = host.rstrip("/")
+    parsed = urlparse(host)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("host must be an IP, hostname, or http(s) URL")
+    # Reject junk like https://host:abc
+    if parsed.port is not None and not (1 <= parsed.port <= 65535):
+        raise ValueError("host port must be between 1 and 65535")
+    return host
 
 
 def _is_private_host(host: str | None) -> bool:
