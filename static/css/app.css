@@ -560,11 +560,18 @@ html[data-theme="light"] .fleet-link-sample {
 .fleet-map-canvas-wrap {
   position: relative;
   width: 100%;
-  height: 280px;
-  min-height: 240px;
+  height: min(52vh, 520px);
+  min-height: 380px;
   border-radius: 12px;
   overflow: hidden;
   background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+
+@media (max-width: 720px) {
+  .fleet-map-canvas-wrap {
+    height: min(46vh, 420px);
+    min-height: 300px;
+  }
 }
 
 #fleet-map-canvas {
@@ -576,6 +583,97 @@ html[data-theme="light"] .fleet-link-sample {
 #fleet-map-canvas .leaflet-container {
   font-family: inherit;
   background: transparent;
+}
+
+/* Readable place names + controls on dark basemap */
+#fleet-map-canvas .leaflet-control-attribution {
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+  color: var(--muted);
+  max-width: min(100%, 280px);
+}
+
+#fleet-map-canvas .leaflet-control-attribution a {
+  color: var(--text);
+}
+
+#fleet-map-canvas .leaflet-bar a {
+  background: var(--bg-panel);
+  color: var(--text);
+  border-bottom-color: var(--border);
+}
+
+#fleet-map-canvas .leaflet-bar a:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+
+#fleet-map-canvas .leaflet-popup-content-wrapper,
+#fleet-map-canvas .leaflet-popup-tip {
+  /* --panel is undefined; invalid var() made the popup background transparent */
+  background: var(--bg-panel) !important;
+  color: var(--text);
+  opacity: 1;
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+#fleet-map-canvas .leaflet-popup-content-wrapper {
+  border-radius: 10px;
+}
+
+#fleet-map-canvas .leaflet-popup-content {
+  margin: 12px 14px;
+  color: var(--text);
+}
+
+#fleet-map-canvas .leaflet-popup-content-wrapper .muted {
+  color: var(--muted);
+}
+
+#fleet-map-canvas .leaflet-container a.leaflet-popup-close-button {
+  color: var(--muted);
+  opacity: 1;
+}
+
+#fleet-map-canvas .leaflet-container a.leaflet-popup-close-button:hover {
+  color: var(--text);
+}
+
+html:not([data-theme="light"]) #fleet-map-canvas .leaflet-pane.fleetLabels {
+  /* Brighten Esri reference labels so place names stay readable */
+  filter: brightness(1.55) contrast(1.25) saturate(1.1);
+}
+
+.fleet-continent-label-icon.leaflet-div-icon,
+.fleet-continent-label-icon {
+  background: transparent !important;
+  border: none !important;
+  overflow: visible !important;
+}
+
+.fleet-continent-label {
+  display: inline-block;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #e8eef9;
+  text-shadow:
+    0 0 6px rgba(0, 0, 0, 0.9),
+    0 1px 2px rgba(0, 0, 0, 0.95),
+    0 0 1px rgba(0, 0, 0, 1);
+  pointer-events: none;
+  user-select: none;
+  opacity: 0.95;
+}
+
+html[data-theme="light"] .fleet-continent-label {
+  color: #1e293b;
+  text-shadow:
+    0 0 4px rgba(255, 255, 255, 0.95),
+    0 1px 0 rgba(255, 255, 255, 0.9);
 }
 
 /* Leaflet clips overflow on marker icons — keep ping inside a 36×36 box. */

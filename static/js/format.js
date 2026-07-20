@@ -181,6 +181,7 @@ export function appliancesSignature(list) {
       a.display_name,
       a.cluster_display_name,
       a.location,
+      a.cloud || "",
       a.host,
       a.last_status,
       a.fail_count,

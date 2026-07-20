@@ -40,7 +40,7 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js?v=20260720mapflash1";
+} from "./dashboard.js?v=20260720popup1";
 
 const dom = getDom();
 const {
@@ -248,6 +248,7 @@ form.addEventListener("submit", async (e) => {
     password: fd.get("password"),
     display_name: fd.get("display_name") || undefined,
     location: String(fd.get("location") || "").trim() || undefined,
+    cloud: String(fd.get("cloud") || "").trim() || undefined,
     discover_cluster: fd.get("discover_cluster") === "on",
   };
   try {

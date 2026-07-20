@@ -46,6 +46,7 @@ export function openEditModal(appliance, target = "appliance") {
     editModalSub,
     editNameLabel,
     editLocationWrap,
+    editCloudWrap,
   } = getDom();
   if (!editModal || !editForm || !appliance) return;
   const shortHost = shortHostOf(appliance);
@@ -55,8 +56,8 @@ export function openEditModal(appliance, target = "appliance") {
   }
   if (editModalSub) {
     editModalSub.textContent = isCluster
-      ? "Update the cluster display name. Location is set on each node, not the cluster."
-      : "Update the display name and location for this node.";
+      ? "Update the cluster display name. Location and cloud are set on each node, not the cluster."
+      : "Update the display name, location, and cloud for this node.";
   }
   if (editNameLabel) {
     const input = editNameLabel.querySelector("input");
@@ -87,6 +88,16 @@ export function openEditModal(appliance, target = "appliance") {
         selectedKey: key,
         previousLabel: previous,
       }).catch(() => null);
+    }
+  }
+  if (editCloudWrap) {
+    const cloudInput = editCloudWrap.querySelector("input[name=cloud]");
+    if (isCluster) {
+      editCloudWrap.hidden = true;
+      if (cloudInput) cloudInput.value = "";
+    } else {
+      editCloudWrap.hidden = false;
+      if (cloudInput) cloudInput.value = appliance.cloud || "";
     }
   }
   editForm.querySelector("input[name=appliance_id]").value = String(appliance.id);
@@ -141,6 +152,7 @@ function networkMetaHtml(a) {
   const publicIp = (a.public_host || "").trim();
   const privateIp = (a.private_host || "").trim();
   const location = (a.location_label || a.location || "").trim();
+  const cloud = (a.cloud || "").trim();
   const rows = [];
   if (hostname) {
     rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">CM hostname</span><span class="tree-meta-value">${escapeHtml(hostname)}</span></span>`);
@@ -154,6 +166,9 @@ function networkMetaHtml(a) {
   if (location) {
     const needsUpdate = a.location_mapped === false ? " (update)" : "";
     rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Location</span><span class="tree-meta-value">${escapeHtml(location)}${needsUpdate}</span></span>`);
+  }
+  if (cloud) {
+    rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Cloud</span><span class="tree-meta-value">${escapeHtml(cloud)}</span></span>`);
   }
   if (!rows.length) {
     rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Connect</span><span class="tree-meta-value">${escapeHtml(shortHostOf(a))}</span></span>`);
@@ -418,11 +433,72 @@ function destroyFleetMap() {
   }
   state.fleetMap = null;
   state.fleetMapTileLayer = null;
+  state.fleetMapLabelLayer = null;
+  state.fleetMapContinents = null;
   state.fleetMapMarkers = null;
   state.fleetMapLinks = null;
   state.fleetMapSig = null;
   state.fleetMapFitted = false;
   state.fleetMapTheme = null;
+}
+
+/** Dark-mode only at world zoom — light Carto tiles already print continent names. */
+const CONTINENT_LABELS = [
+  { name: "North America", lat: 48, lng: -100 },
+  { name: "South America", lat: -14, lng: -58 },
+  { name: "Europe", lat: 54, lng: 15 },
+  { name: "Africa", lat: 8, lng: 20 },
+  { name: "Asia", lat: 45, lng: 90 },
+  { name: "Oceania", lat: -25, lng: 134 },
+];
+const CONTINENT_LABEL_MAX_ZOOM = 3.5;
+
+function syncContinentLabels() {
+  const map = state.fleetMap;
+  const group = state.fleetMapContinents;
+  if (!map || !group) return;
+  try {
+    // Light basemap already has continent labels; ours would duplicate them.
+    const show =
+      currentTheme() !== "light" && map.getZoom() <= CONTINENT_LABEL_MAX_ZOOM;
+    if (show) {
+      if (!map.hasLayer(group)) group.addTo(map);
+    } else if (map.hasLayer(group)) {
+      map.removeLayer(group);
+    }
+  } catch (_) { /* ignore */ }
+}
+
+function ensureContinentLabels(map) {
+  if (!map) return;
+  if (!state.fleetMapContinents) {
+    if (!map.getPane("fleetContinents")) {
+      map.createPane("fleetContinents");
+      const pane = map.getPane("fleetContinents");
+      pane.style.zIndex = "450";
+      pane.style.pointerEvents = "none";
+    }
+
+    const group = L.layerGroup();
+    for (const c of CONTINENT_LABELS) {
+      const icon = L.divIcon({
+        className: "fleet-continent-label-icon",
+        html: `<span class="fleet-continent-label">${c.name}</span>`,
+        iconSize: [0, 0],
+        iconAnchor: [0, 0],
+      });
+      L.marker([c.lat, c.lng], {
+        icon,
+        pane: "fleetContinents",
+        interactive: false,
+        keyboard: false,
+      }).addTo(group);
+    }
+    state.fleetMapContinents = group;
+    map.on("zoomend", syncContinentLabels);
+    map.on("viewreset", syncContinentLabels);
+  }
+  syncContinentLabels();
 }
 
 function fleetMapSignature() {
@@ -443,10 +519,67 @@ function fleetMapSignature() {
   return JSON.stringify({ theme: currentTheme(), markers: rows });
 }
 
-function mapTileUrl() {
-  return currentTheme() === "light"
-    ? "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
-    : "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+/** Basemap + optional label overlay. Dark Carto labels are too dim; Esri ref is readable. */
+function mapBasemapSpec() {
+  if (currentTheme() === "light") {
+    return {
+      base: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+      labels: null,
+      subdomains: "abcd",
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+    };
+  }
+  return {
+    base: "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    labels:
+      "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
+    subdomains: null,
+    attribution: 'Tiles &copy; <a href="https://www.esri.com/">Esri</a>',
+  };
+}
+
+function removeFleetMapTileLayers() {
+  if (!state.fleetMap) return;
+  for (const key of ["fleetMapTileLayer", "fleetMapLabelLayer"]) {
+    const layer = state[key];
+    if (!layer) continue;
+    try {
+      state.fleetMap.removeLayer(layer);
+    } catch (_) { /* ignore */ }
+    state[key] = null;
+  }
+}
+
+function applyFleetMapTiles(map) {
+  removeFleetMapTileLayers();
+  const spec = mapBasemapSpec();
+  const baseOpts = {
+    maxZoom: 8,
+    minZoom: 1,
+    attribution: spec.attribution,
+  };
+  if (spec.subdomains) baseOpts.subdomains = spec.subdomains;
+  const tiles = L.tileLayer(spec.base, baseOpts);
+  tiles.addTo(map);
+  state.fleetMapTileLayer = tiles;
+
+  if (spec.labels) {
+    if (!map.getPane("fleetLabels")) {
+      map.createPane("fleetLabels");
+      const pane = map.getPane("fleetLabels");
+      pane.style.zIndex = "350";
+      pane.style.pointerEvents = "none";
+    }
+    const labels = L.tileLayer(spec.labels, {
+      maxZoom: 8,
+      minZoom: 1,
+      pane: "fleetLabels",
+      opacity: 1,
+    });
+    labels.addTo(map);
+    state.fleetMapLabelLayer = labels;
+  }
 }
 
 function applianceMapTone(a) {
@@ -467,17 +600,12 @@ function ensureFleetMap() {
     attributionControl: true,
   }).setView([20, 0], 2);
 
-  const tiles = L.tileLayer(mapTileUrl(), {
-    maxZoom: 8,
-    minZoom: 1,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
-  });
-  tiles.addTo(map);
+  applyFleetMapTiles(map);
+  ensureContinentLabels(map);
 
   const links = L.layerGroup().addTo(map);
   const markers = L.layerGroup().addTo(map);
   state.fleetMap = map;
-  state.fleetMapTileLayer = tiles;
   state.fleetMapLinks = links;
   state.fleetMapMarkers = markers;
   state.fleetMapTheme = currentTheme();
@@ -492,20 +620,15 @@ function ensureFleetMap() {
 }
 
 function syncFleetMapTiles({ force = false } = {}) {
-  if (!state.fleetMap || !state.fleetMapTileLayer) return;
+  if (!state.fleetMap) return;
   const theme = currentTheme();
-  if (!force && state.fleetMapTheme === theme) return;
-  try {
-    state.fleetMap.removeLayer(state.fleetMapTileLayer);
-  } catch (_) { /* ignore */ }
-  const tiles = L.tileLayer(mapTileUrl(), {
-    maxZoom: 8,
-    minZoom: 1,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
-  });
-  tiles.addTo(state.fleetMap);
-  state.fleetMapTileLayer = tiles;
+  if (!force && state.fleetMapTheme === theme && state.fleetMapTileLayer) {
+    syncContinentLabels();
+    return;
+  }
+  applyFleetMapTiles(state.fleetMap);
   state.fleetMapTheme = theme;
+  ensureContinentLabels(state.fleetMap);
 }
 
 function clusterRootId(a, byId) {
@@ -638,8 +761,10 @@ function paintFleetMap({ forceFit = false } = {}) {
       iconSize: [36, 36],
       iconAnchor: [18, 18],
     });
+    const cloudLabel = (a.cloud || "").trim();
+    const popupMeta = [locLabel, cloudLabel, tone].filter(Boolean).join(" · ");
     const html = `<div class="fleet-map-popup"><strong>${escapeHtml(name)}</strong>
-        <div class="muted">${escapeHtml(locLabel)} · ${tone}</div>
+        <div class="muted">${escapeHtml(popupMeta)}</div>
         <button type="button" data-appliance-id="${id}">Open Overview</button></div>`;
     const marker = L.marker([pos.lat, pos.lng], { icon }).bindPopup(html);
     marker.on("popupopen", (ev) => {
@@ -847,6 +972,7 @@ export async function submitEditForm(e) {
   } else {
     body.display_name = String(fd.get("display_name") || "").trim();
     body.location = readLocationKey(editForm);
+    body.cloud = String(fd.get("cloud") || "").trim();
   }
   if (btnEditSave) {
     btnEditSave.disabled = true;

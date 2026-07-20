@@ -243,6 +243,7 @@ class MetricsScraper:
         domain: str = "",
         discover_cluster: bool = True,
         location: str | None = None,
+        cloud: str | None = None,
     ) -> dict[str, Any]:
         """Login, enable metrics, persist appliance, optionally auto-add cluster peers.
 
@@ -263,6 +264,7 @@ class MetricsScraper:
                 domain=domain,
                 discover_cluster=discover_cluster,
                 location=location,
+                cloud=cloud,
             )
         except Exception:
             appliance_delete.resume_purges()
@@ -289,6 +291,7 @@ class MetricsScraper:
         domain: str = "",
         discover_cluster: bool = True,
         location: str | None = None,
+        cloud: str | None = None,
     ) -> tuple[dict[str, Any], Any]:
         client = CMClient(host=host, username=username, password=password, domain=domain)
         client.login()
@@ -306,6 +309,7 @@ class MetricsScraper:
             display_name=display_name,
             domain=domain,
             location=location,
+            cloud=cloud,
         )
         aid = int(appliance["id"])
         db.update_appliance_auth(

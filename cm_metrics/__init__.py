@@ -91,6 +91,7 @@ def create_app() -> Flask:
             location = normalize_location_key(payload.get("location"))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        cloud = db.normalize_cloud(payload.get("cloud"))
 
         try:
             result = scraper.connect_appliance(
@@ -101,6 +102,7 @@ def create_app() -> Flask:
                 domain="",  # always root domain
                 discover_cluster=discover,
                 location=location,
+                cloud=cloud,
             )
             return jsonify(result), 201
         except CMClientError as exc:
@@ -212,6 +214,12 @@ def create_app() -> Flask:
                 )
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
+            if not updated:
+                return jsonify({"error": "not found"}), 404
+        if "cloud" in payload:
+            updated = db.update_appliance_cloud(
+                appliance_id, str(payload.get("cloud") or "")
+            )
             if not updated:
                 return jsonify({"error": "not found"}), 404
         appliance = updated or db.get_appliance(appliance_id)

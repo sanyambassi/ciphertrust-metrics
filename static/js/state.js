@@ -21,6 +21,8 @@ export const state = {
   scrapeAgeTimer: null,
   fleetMap: null,
   fleetMapTileLayer: null,
+  fleetMapLabelLayer: null,
+  fleetMapContinents: null,
   fleetMapMarkers: null,
   fleetMapLinks: null,
   /** Signature of last painted map markers — skip redraw when unchanged. */
@@ -77,6 +79,7 @@ export function getDom() {
     editModalSub: document.getElementById("edit-modal-sub"),
     editNameLabel: document.getElementById("edit-name-label"),
     editLocationWrap: document.getElementById("edit-location-wrap"),
+    editCloudWrap: document.getElementById("edit-cloud-wrap"),
     btnEditCancel: document.getElementById("btn-edit-cancel"),
     btnEditSave: document.getElementById("btn-edit-save"),
   };

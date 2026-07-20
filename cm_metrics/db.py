@@ -344,6 +344,7 @@ def init_db() -> None:
                 ("public_host", "TEXT"),
                 ("private_host", "TEXT"),
                 ("location", "TEXT"),
+                ("cloud", "TEXT"),
                 ("cm_uptime", "TEXT"),
                 ("delete_pending", "INTEGER DEFAULT 0"),
             ):
@@ -643,6 +644,12 @@ def find_appliance_matching_host(
     return None
 
 
+def normalize_cloud(value: str | None) -> str | None:
+    """Optional free-text cloud/environment label (On-Prem, AWS, Azure, GCP, …)."""
+    text = (value or "").strip()
+    return text or None
+
+
 def create_or_update_appliance(
     host: str,
     username: str,
@@ -650,6 +657,7 @@ def create_or_update_appliance(
     display_name: str | None = None,
     domain: str = "",
     location: str | None = None,
+    cloud: str | None = None,
 ) -> dict[str, Any]:
     from .locations import normalize_location_key
 
@@ -658,6 +666,7 @@ def create_or_update_appliance(
     now = time.time()
     password_enc = encrypt_text(password)
     loc = normalize_location_key(location)
+    cloud_val = normalize_cloud(cloud)
     with connect() as conn:
         existing = conn.execute("SELECT id FROM appliances WHERE host = ?", (host,)).fetchone()
         if existing:
@@ -665,21 +674,30 @@ def create_or_update_appliance(
                 """
                 UPDATE appliances
                 SET username = ?, password_enc = ?, display_name = COALESCE(?, display_name),
-                    domain = ?, location = COALESCE(?, location),
+                    domain = ?, location = COALESCE(?, location), cloud = COALESCE(?, cloud),
                     updated_at = ?, enabled = 1, last_error = NULL, last_status = 'pending',
                     fail_count = 0
                 WHERE id = ?
                 """,
-                (username, password_enc, display_name, domain or "", loc, now, existing["id"]),
+                (
+                    username,
+                    password_enc,
+                    display_name,
+                    domain or "",
+                    loc,
+                    cloud_val,
+                    now,
+                    existing["id"],
+                ),
             )
             appliance_id = int(existing["id"])
         else:
             cur = conn.execute(
                 """
                 INSERT INTO appliances (
-                    host, display_name, username, password_enc, domain, location,
+                    host, display_name, username, password_enc, domain, location, cloud,
                     created_at, updated_at, enabled, last_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending')
                 """,
                 (
                     host,
@@ -688,6 +706,7 @@ def create_or_update_appliance(
                     password_enc,
                     domain or "",
                     loc,
+                    cloud_val,
                     now,
                     now,
                 ),
@@ -1131,6 +1150,19 @@ def update_appliance_location(appliance_id: int, location: str | None) -> dict[s
         cur = conn.execute(
             "UPDATE appliances SET location = ?, updated_at = ? WHERE id = ?",
             (loc, time.time(), appliance_id),
+        )
+        if cur.rowcount <= 0:
+            return None
+    return get_appliance(appliance_id)
+
+
+def update_appliance_cloud(appliance_id: int, cloud: str | None) -> dict[str, Any] | None:
+    """Set or clear the optional free-text cloud/environment label."""
+    init_db()
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE appliances SET cloud = ?, updated_at = ? WHERE id = ?",
+            (normalize_cloud(cloud), time.time(), appliance_id),
         )
         if cur.rowcount <= 0:
             return None
