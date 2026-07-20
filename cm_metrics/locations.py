@@ -85,6 +85,28 @@ _US_STATES: list[tuple[str, str, float, float]] = [
     ("wy", "Wyoming", 41.14, -104.82),
 ]
 
+# Popular US metro areas (in addition to states).
+_US_CITIES: list[tuple[str, str, float, float]] = [
+    ("las-vegas", "Las Vegas", 36.17, -115.14),
+    ("reno", "Reno", 39.53, -119.81),
+    ("phoenix", "Phoenix", 33.45, -112.07),
+    ("seattle", "Seattle", 47.61, -122.33),
+    ("portland", "Portland", 45.52, -122.68),
+    ("san-francisco", "San Francisco", 37.77, -122.42),
+    ("los-angeles", "Los Angeles", 34.05, -118.24),
+    ("san-diego", "San Diego", 32.72, -117.16),
+    ("denver", "Denver", 39.74, -104.99),
+    ("chicago", "Chicago", 41.88, -87.63),
+    ("dallas", "Dallas", 32.78, -96.80),
+    ("austin", "Austin", 30.27, -97.74),
+    ("houston", "Houston", 29.76, -95.37),
+    ("atlanta", "Atlanta", 33.75, -84.39),
+    ("miami", "Miami", 25.76, -80.19),
+    ("boston", "Boston", 42.36, -71.06),
+    ("new-york-city", "New York City", 40.71, -74.01),
+    ("ashburn", "Ashburn", 39.04, -77.49),
+]
+
 _CA_PROVINCES: list[tuple[str, str, float, float]] = [
     ("ab", "Alberta", 53.55, -113.49),
     ("bc", "British Columbia", 49.28, -123.12),
@@ -250,6 +272,22 @@ def _build_locations() -> list[dict[str, Any]]:
                 code.upper(),
                 f"US {name}",
                 f"USA {name}",
+            )
+        )
+
+    for code, name, lat, lng in _US_CITIES:
+        aliases = [name, f"US {name}", f"USA {name}"]
+        if code == "las-vegas":
+            aliases.extend(["Vegas", "Las Vegas NV", "LV"])
+        out.append(
+            _loc(
+                f"us-city-{code}",
+                "North America",
+                "United States",
+                name,
+                lat,
+                lng,
+                *aliases,
             )
         )
 

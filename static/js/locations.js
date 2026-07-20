@@ -37,10 +37,8 @@ function suggestionHaystack(s) {
 
 function filterSuggestions(suggestions, query, limit = 12) {
   const q = String(query || "").trim().toLowerCase();
-  if (!q) {
-    // Light default list when focused with empty query.
-    return suggestions.slice(0, limit);
-  }
+  // Require typing — do not dump the catalog on bare focus/click.
+  if (q.length < 1) return [];
   const scored = [];
   for (const s of suggestions) {
     const hay = suggestionHaystack(s);
@@ -50,7 +48,7 @@ function filterSuggestions(suggestions, query, limit = 12) {
     else if (label.includes(q)) score = 80;
     else if (hay.includes(q)) score = 50;
     else {
-      // Match all tokens (e.g. "us oregon", "california")
+      // Match all tokens (e.g. "us oregon", "las vegas")
       const tokens = q.split(/\s+/).filter(Boolean);
       if (tokens.length && tokens.every((t) => hay.includes(t))) score = 40;
     }
@@ -135,10 +133,18 @@ export async function initLocationFields(root, { selectedKey = "", previousLabel
   };
 
   const refresh = () => {
-    renderList(filterSuggestions(suggestions, search.value));
+    const q = String(search.value || "").trim();
+    if (!q) {
+      hideList();
+      return;
+    }
+    renderList(filterSuggestions(suggestions, q));
   };
 
-  search.onfocus = () => refresh();
+  // Focus alone does not open the list — user must type to search.
+  search.onfocus = () => {
+    if (String(search.value || "").trim()) refresh();
+  };
   search.oninput = () => {
     // Typing invalidates prior selection until a suggestion is chosen.
     const current = suggestions.find((s) => s.key === currentKey);
