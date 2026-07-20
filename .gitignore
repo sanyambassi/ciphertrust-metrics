@@ -20,19 +20,14 @@ data/
 *.pem
 *.key
 
-# Local deploy / scratch scripts
-_deploy*.py
-_redeploy*.py
-_push*.py
+# Local deploy / scratch scripts (may contain host passwords, IPs, usernames)
+_*.py
 _tmp*
 _*.txt
 _*.sh
 _*.json
 _res_out*
-_*.txt
-_*.sh
-_*.json
-_res_out*
+docs/screenshots-review/
 
 # IDE
 .cursor/
