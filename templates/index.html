@@ -17,7 +17,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=20260720cmport1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=20260720cmport2" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -142,7 +142,7 @@
             <input name="host" required placeholder="10.1.2.3 or cm.example.com" autocomplete="off" />
           </label>
           <label class="port-field">HTTPS port <span class="optional">(optional)</span>
-            <input name="port" type="number" min="1" max="65535" placeholder="443" inputmode="numeric" autocomplete="off" />
+            <input name="port" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="443" autocomplete="off" />
           </label>
         </div>
         <label>Username
@@ -201,6 +201,6 @@
       dashboardGroups: {{ dashboard_groups | tojson }}
     };
   </script>
-  <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=20260720cmport1"></script>
+  <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=20260720cmport2"></script>
 </body>
 </html>
