@@ -199,6 +199,43 @@ function panelSpanClass(panel) {
   return "span-12";
 }
 
+function panelHeadHtml(panel) {
+  const linkId = (panel.link_dashboard || "").trim();
+  const link = linkId
+    ? `<button type="button" class="panel-dash-link" data-dashboard="${escapeHtml(linkId)}">${escapeHtml(
+        panel.link_label || "View dashboard"
+      )}</button>`
+    : "";
+  return `<div class="panel-head"><h3 class="panel-title">${escapeHtml(panel.title)}</h3>${link}</div>`;
+}
+
+/** Jump from an overview widget to its attached board (group tab + chip). */
+export async function openAttachedDashboard(dashboardId) {
+  const id = String(dashboardId || "").trim();
+  if (!id) return;
+  const groupId = groupForDashboard(id);
+  state.viewMode = "dashboard";
+  persistTabChip(groupId, id);
+  state.groupId = groupId;
+  state.dashboardId = id;
+  state.panelMeta = null;
+  renderApplianceList(true);
+  syncWorkspaceChrome();
+  await loadDashboard(id, { forceFull: true });
+}
+
+function bindPanelDashLinks(root) {
+  root?.querySelectorAll(".panel-dash-link").forEach((btn) => {
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openAttachedDashboard(btn.getAttribute("data-dashboard"));
+    });
+  });
+}
+
 function renderStat(panel, animate) {
   const el = document.createElement("article");
   const isText = typeof panel.value === "string";
@@ -215,7 +252,7 @@ function renderStat(panel, animate) {
   if (toneClass) el.dataset.tone = tone;
   const unitText = isText ? "" : displayUnit(panel.unit, panel.value);
   el.innerHTML = `
-    <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+    ${panelHeadHtml(panel)}
     <div class="stat-value"><span class="stat-num">${escapeHtml(fmt(panel.value, panel.unit))}</span>${
       unitText ? `<span class="stat-unit">${escapeHtml(unitText)}</span>` : ""
     }</div>
@@ -412,7 +449,7 @@ function renderTimeseries(panel, animate) {
   el.dataset.panelTitle = panel.title;
   el.dataset.panelType = "timeseries";
   el.innerHTML = `
-    <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+    ${panelHeadHtml(panel)}
     <div class="chart-wrap"><canvas></canvas></div>
   `;
   const chart = makeLineChart(el.querySelector("canvas"), panel);
@@ -426,7 +463,7 @@ function renderBar(panel, animate) {
   el.dataset.panelTitle = panel.title;
   el.dataset.panelType = "bar";
   el.innerHTML = `
-    <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+    ${panelHeadHtml(panel)}
     <div class="chart-wrap"><canvas></canvas></div>
   `;
   const chart = makeBarChart(el.querySelector("canvas"), panel);
@@ -442,7 +479,7 @@ function renderTable(panel, animate) {
   const cols = panel.columns || [];
   const rows = panel.rows || [];
   el.innerHTML = `
-    <h3 class="panel-title">${escapeHtml(panel.title)}</h3>
+    ${panelHeadHtml(panel)}
     <div class="table-wrap">
       <table class="data">
         <thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>
@@ -789,6 +826,7 @@ export function fullRender(data, animate = true) {
     }
     row.appendChild(node);
   });
+  bindPanelDashLinks(panelsEl);
   state.panelMeta = panelSignature(data);
 }
 

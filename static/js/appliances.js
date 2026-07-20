@@ -7,15 +7,21 @@ import { RANGE_OPTIONS } from "./config.js";
 let loadDashboard = async () => {};
 let destroyCharts = () => {};
 let syncWorkspaceChrome = () => {};
+let openOverview = async () => {};
 
 /** Inject dashboard helpers from main to avoid circular imports. */
 export function setDashboardLoader(fn) {
   if (typeof fn === "function") loadDashboard = fn;
 }
 
-export function setDashboardChrome({ destroyCharts: dc, syncWorkspaceChrome: swc } = {}) {
+export function setDashboardChrome({
+  destroyCharts: dc,
+  syncWorkspaceChrome: swc,
+  openOverview: ov,
+} = {}) {
   if (typeof dc === "function") destroyCharts = dc;
   if (typeof swc === "function") syncWorkspaceChrome = swc;
+  if (typeof ov === "function") openOverview = ov;
 }
 
 export function openModal() {
@@ -171,6 +177,9 @@ function nodeActionsHtml(a, { editTarget = "appliance", label = "" } = {}) {
   const syncing = state.syncingApplianceIds?.has(a.id);
   return `
     <span class="tree-node-actions">
+      <button type="button" class="appliance-open-overview" data-id="${a.id}" title="Open Overview dashboard" aria-label="Open Overview for ${escapeHtml(label)}">
+        Overview
+      </button>
       <button type="button" class="appliance-retry${syncing ? " is-syncing" : ""}" data-id="${a.id}" title="${escapeHtml(syncTitle)}" aria-label="${escapeHtml(syncLabel)}"${syncing ? " disabled" : ""}>
         <svg class="icon-retry" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
           <path fill="currentColor" d="M12 6V3L8 7l4 4V8c2.76 0 5 2.24 5 5a5 5 0 0 1-9.9 1H5.08A7 7 0 0 0 19 13c0-3.87-3.13-7-7-7z"/>
@@ -883,6 +892,21 @@ export async function pollDeleteNotifications() {
 
 export async function handleApplianceAction(e) {
   const { panelsEl, descEl } = getDom();
+  const overviewBtn = e.target.closest(".appliance-open-overview");
+  if (overviewBtn) {
+    e.preventDefault();
+    e.stopPropagation();
+    const id = Number(overviewBtn.dataset.id);
+    if (!id) return true;
+    state.applianceId = id;
+    state.panelMeta = null;
+    setApplianceMenuOpen(false);
+    renderApplianceList(true);
+    await openOverview();
+    await refreshStatus().catch(() => null);
+    return true;
+  }
+
   const editBtn = e.target.closest(".appliance-edit");
   if (editBtn) {
     e.preventDefault();

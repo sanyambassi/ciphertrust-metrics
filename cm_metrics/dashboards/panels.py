@@ -33,6 +33,19 @@ def _series_since() -> float | None:
     return time.time() - float(secs)
 
 
+def _with_link(
+    panel: dict[str, Any],
+    *,
+    link_dashboard: str = "",
+    link_label: str = "View dashboard",
+) -> dict[str, Any]:
+    """Attach a jump target to another board (DSPM-style widget → dashboard)."""
+    if link_dashboard:
+        panel["link_dashboard"] = link_dashboard
+        panel["link_label"] = link_label or "View dashboard"
+    return panel
+
+
 def _stat(
     title: str,
     value: float | str | None = None,
@@ -40,6 +53,8 @@ def _stat(
     description: str = "",
     *,
     tone: str = "",
+    link_dashboard: str = "",
+    link_label: str = "View dashboard",
 ) -> dict[str, Any]:
     out_value: float | str | None
     if value is None:
@@ -48,14 +63,18 @@ def _stat(
         out_value = round(value, 4)
     else:
         out_value = value
-    return {
-        "type": "stat",
-        "title": title,
-        "description": description,
-        "value": out_value,
-        "unit": unit,
-        "tone": (tone or "").lower(),
-    }
+    return _with_link(
+        {
+            "type": "stat",
+            "title": title,
+            "description": description,
+            "value": out_value,
+            "unit": unit,
+            "tone": (tone or "").lower(),
+        },
+        link_dashboard=link_dashboard,
+        link_label=link_label,
+    )
 
 
 def _note(text: str, *, title: str = "", tone: str = "") -> dict[str, Any]:
@@ -80,15 +99,21 @@ def _timeseries(
     description: str = "",
     *,
     wide: bool = False,
+    link_dashboard: str = "",
+    link_label: str = "View dashboard",
 ) -> dict[str, Any]:
-    return {
-        "type": "timeseries",
-        "title": title,
-        "description": description,
-        "unit": unit,
-        "series": series,
-        "wide": wide,
-    }
+    return _with_link(
+        {
+            "type": "timeseries",
+            "title": title,
+            "description": description,
+            "unit": unit,
+            "series": series,
+            "wide": wide,
+        },
+        link_dashboard=link_dashboard,
+        link_label=link_label,
+    )
 
 
 def _bar(
@@ -98,15 +123,21 @@ def _bar(
     description: str = "",
     *,
     wide: bool = False,
+    link_dashboard: str = "",
+    link_label: str = "View dashboard",
 ) -> dict[str, Any]:
-    return {
-        "type": "bar",
-        "title": title,
-        "description": description,
-        "unit": unit,
-        "items": items,
-        "wide": wide,
-    }
+    return _with_link(
+        {
+            "type": "bar",
+            "title": title,
+            "description": description,
+            "unit": unit,
+            "items": items,
+            "wide": wide,
+        },
+        link_dashboard=link_dashboard,
+        link_label=link_label,
+    )
 
 
 def _short_account_label(account: str) -> str:

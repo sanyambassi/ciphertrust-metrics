@@ -2111,6 +2111,39 @@ code {
 .panel.span-11 { grid-column: span 11; }
 .panel.span-12 { grid-column: span 12; }
 
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 12px;
+  flex-shrink: 0;
+}
+
+.panel-head .panel-title {
+  margin: 0;
+}
+
+.panel-dash-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  padding: 0;
+  white-space: nowrap;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  opacity: 0.9;
+}
+
+.panel-dash-link:hover {
+  opacity: 1;
+}
+
 .panel-title {
   font-size: 11px;
   font-weight: 600;
@@ -2120,6 +2153,24 @@ code {
   text-transform: uppercase;
   line-height: 1.2;
   flex-shrink: 0;
+}
+
+.appliance-open-overview {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.appliance-open-overview:hover {
+  border-color: var(--accent);
+  background: var(--accent-dim, rgba(0, 120, 212, 0.08));
 }
 
 .stat-value {

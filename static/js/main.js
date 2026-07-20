@@ -40,7 +40,7 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js?v=20260717crdpname1";
+} from "./dashboard.js?v=20260720attach1";
 
 const dom = getDom();
 const {
@@ -60,7 +60,11 @@ const {
 } = dom;
 
 setDashboardLoader(loadDashboard);
-setDashboardChrome({ destroyCharts, syncWorkspaceChrome });
+setDashboardChrome({
+  destroyCharts,
+  syncWorkspaceChrome,
+  openOverview: () => showDashboardGroup("overview"),
+});
 
 applyChartDefaults();
 syncThemeButton();
@@ -163,7 +167,7 @@ document.addEventListener("keydown", (e) => {
 applianceTree?.addEventListener("click", async (e) => {
   if (await handleApplianceAction(e)) return;
   const select = e.target.closest(".tree-node-select, .tree-node");
-  if (!select || e.target.closest(".tree-node-actions, .appliance-edit, .appliance-delete, .appliance-retry")) return;
+  if (!select || e.target.closest(".tree-node-actions, .appliance-edit, .appliance-delete, .appliance-retry, .appliance-open-overview")) return;
   const node = select.closest(".tree-node") || select;
   const id = Number(node.dataset.id);
   if (!id) return;
