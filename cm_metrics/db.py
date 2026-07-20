@@ -523,7 +523,9 @@ def list_appliances(include_secrets: bool = False) -> list[dict[str, Any]]:
         item["is_clustered"] = bool(item.get("is_clustered"))
         item["is_primary"] = bool(item.get("is_primary"))
         item["enabled"] = bool(item.get("enabled"))
-        out.append(enrich_appliance_network(item))
+        from .locations import enrich_appliance_location
+
+        out.append(enrich_appliance_location(enrich_appliance_network(item)))
     return out
 
 
@@ -560,7 +562,9 @@ def get_appliance(appliance_id: int, include_secrets: bool = False) -> dict[str,
     item["is_clustered"] = bool(item.get("is_clustered"))
     item["is_primary"] = bool(item.get("is_primary"))
     item["enabled"] = bool(item.get("enabled"))
-    return enrich_appliance_network(item)
+    from .locations import enrich_appliance_location
+
+    return enrich_appliance_location(enrich_appliance_network(item))
 
 
 def get_appliance_auth_tokens(appliance_id: int) -> dict[str, Any]:
@@ -647,11 +651,13 @@ def create_or_update_appliance(
     domain: str = "",
     location: str | None = None,
 ) -> dict[str, Any]:
+    from .locations import normalize_location_key
+
     init_db()
     host = normalize_host(host)
     now = time.time()
     password_enc = encrypt_text(password)
-    loc = (location or "").strip() or None
+    loc = normalize_location_key(location)
     with connect() as conn:
         existing = conn.execute("SELECT id FROM appliances WHERE host = ?", (host,)).fetchone()
         if existing:
@@ -1116,8 +1122,10 @@ def update_appliance_display_name(appliance_id: int, display_name: str) -> dict[
 
 
 def update_appliance_location(appliance_id: int, location: str | None) -> dict[str, Any] | None:
-    """Set or clear the optional location label for an appliance."""
-    loc = (location or "").strip() or None
+    """Set or clear the optional curated location key for an appliance."""
+    from .locations import normalize_location_key
+
+    loc = normalize_location_key(location)
     init_db()
     with connect() as conn:
         cur = conn.execute(

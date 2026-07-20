@@ -55,8 +55,8 @@ export function resizeChartsSoon() {
     state.charts.forEach(({ chart }) => {
       try { chart.resize(); } catch (_) { /* ignore */ }
     });
-    if (state.fleetHealthChart && !state.fleetHealthChart.destroyed) {
-      try { state.fleetHealthChart.resize(); } catch (_) { /* ignore */ }
+    if (state.fleetMap) {
+      try { state.fleetMap.invalidateSize(); } catch (_) { /* ignore */ }
     }
   });
 }

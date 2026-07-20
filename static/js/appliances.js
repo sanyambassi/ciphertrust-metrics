@@ -1,8 +1,8 @@
-import { escapeHtml, appliancesSignature, tsLabel, formatCmUptime } from "./format.js";
+import { escapeHtml, appliancesSignature, formatCmUptime } from "./format.js";
 import { fetchJSON, refreshStatus } from "./api.js";
 import { state, getDom } from "./state.js";
-import { cssVar } from "./theme.js";
-import { RANGE_OPTIONS } from "./config.js";
+import { currentTheme } from "./theme.js";
+import { initLocationFields, readLocationKey } from "./locations.js";
 
 let loadDashboard = async () => {};
 let destroyCharts = () => {};
@@ -25,10 +25,11 @@ export function setDashboardChrome({
 }
 
 export function openModal() {
-  const { modal, formError, form } = getDom();
+  const { modal, formError, form, connectLocationFields } = getDom();
   modal.hidden = false;
   formError.hidden = true;
   formError.textContent = "";
+  initLocationFields(connectLocationFields || form, { selectedKey: "" }).catch(() => null);
   form.querySelector("input[name=host]")?.focus();
 }
 
@@ -54,8 +55,8 @@ export function openEditModal(appliance, target = "appliance") {
   }
   if (editModalSub) {
     editModalSub.textContent = isCluster
-      ? "Update the cluster display name."
-      : "Update the display name and location.";
+      ? "Update the cluster display name. Location is set on each node, not the cluster."
+      : "Update the display name and location for this node.";
   }
   if (editNameLabel) {
     const input = editNameLabel.querySelector("input");
@@ -70,9 +71,23 @@ export function openEditModal(appliance, target = "appliance") {
     }
   }
   if (editLocationWrap) {
-    editLocationWrap.hidden = isCluster;
-    const locInput = editLocationWrap.querySelector("input[name=location]");
-    if (locInput) locInput.value = appliance.location || "";
+    // Clusters never have a location — only individual nodes do.
+    if (isCluster) {
+      editLocationWrap.hidden = true;
+      const hiddenLoc = editLocationWrap.querySelector("input[name=location]");
+      if (hiddenLoc) hiddenLoc.value = "";
+    } else {
+      editLocationWrap.hidden = false;
+      const mapped = appliance.location_mapped;
+      const key = mapped ? appliance.location || "" : "";
+      const previous = !mapped
+        ? appliance.location_previous || appliance.location_label || appliance.location || ""
+        : "";
+      initLocationFields(editLocationWrap, {
+        selectedKey: key,
+        previousLabel: previous,
+      }).catch(() => null);
+    }
   }
   editForm.querySelector("input[name=appliance_id]").value = String(appliance.id);
   editForm.querySelector("input[name=edit_target]").value = target;
@@ -125,7 +140,7 @@ function networkMetaHtml(a) {
   const hostname = (a.cm_hostname || a.cm_name || "").trim();
   const publicIp = (a.public_host || "").trim();
   const privateIp = (a.private_host || "").trim();
-  const location = (a.location || "").trim();
+  const location = (a.location_label || a.location || "").trim();
   const rows = [];
   if (hostname) {
     rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">CM hostname</span><span class="tree-meta-value">${escapeHtml(hostname)}</span></span>`);
@@ -137,7 +152,8 @@ function networkMetaHtml(a) {
     rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Private IP</span><span class="tree-meta-value">${escapeHtml(privateIp)}</span></span>`);
   }
   if (location) {
-    rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Location</span><span class="tree-meta-value">${escapeHtml(location)}</span></span>`);
+    const needsUpdate = a.location_mapped === false ? " (update)" : "";
+    rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Location</span><span class="tree-meta-value">${escapeHtml(location)}${needsUpdate}</span></span>`);
   }
   if (!rows.length) {
     rows.push(`<span class="tree-meta-row"><span class="tree-meta-label">Connect</span><span class="tree-meta-value">${escapeHtml(shortHostOf(a))}</span></span>`);
@@ -396,200 +412,266 @@ function treeBranchHtml(nodes, rootId) {
     </ul>`;
 }
 
-function destroyFleetHealthChart() {
-  if (state.fleetHealthChart) {
-    try { state.fleetHealthChart.destroy(); } catch (_) { /* ignore */ }
-    state.fleetHealthChart = null;
+function destroyFleetMap() {
+  if (state.fleetMap) {
+    try { state.fleetMap.remove(); } catch (_) { /* ignore */ }
   }
+  state.fleetMap = null;
+  state.fleetMapTileLayer = null;
+  state.fleetMapMarkers = null;
+  state.fleetMapLinks = null;
 }
 
-function fleetXBounds() {
-  const secs = RANGE_OPTIONS.find((r) => r.id === state.rangeId)?.seconds || 86400;
-  const max = Date.now();
-  return { min: max - secs * 1000, max };
+function mapTileUrl() {
+  return currentTheme() === "light"
+    ? "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+    : "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
 }
 
-function fleetGridColor() {
-  // Soft horizontal guides only — avoid the dense Excel-like lattice.
-  const isLight = document.documentElement.getAttribute("data-theme") === "light";
-  return isLight ? "rgba(15, 23, 42, 0.06)" : "rgba(148, 163, 184, 0.10)";
+function applianceMapTone(a) {
+  const status = String(a.last_status || "").toLowerCase();
+  if (status === "ok") return "online";
+  if (status === "pending") return "pending";
+  return "offline";
 }
 
-function fleetTooltipStyle() {
-  // Explicit pairs so Online/Offline labels stay high-contrast in both themes.
-  // (Do not use --muted for body text, and do not reference --panel — it does not exist.)
-  const isLight = document.documentElement.getAttribute("data-theme") === "light";
-  if (isLight) {
-    return {
-      backgroundColor: "#ffffff",
-      titleColor: "#152033",
-      bodyColor: "#152033",
-      borderColor: "#d5dee8",
-      borderWidth: 1,
-      padding: 10,
-      displayColors: true,
-      multiKeyBackground: "#ffffff",
-    };
-  }
-  return {
-    backgroundColor: "#1a2740",
-    titleColor: "#e8eef9",
-    bodyColor: "#e8eef9",
-    borderColor: "#3a4d6b",
-    borderWidth: 1,
-    padding: 10,
-    displayColors: true,
-    multiKeyBackground: "#1a2740",
-  };
-}
+function ensureFleetMap() {
+  const { fleetMapCanvas } = getDom();
+  if (!fleetMapCanvas || typeof L === "undefined") return null;
+  if (state.fleetMap) return state.fleetMap;
 
-function paintFleetHealthChart(points) {
-  const { fleetHealthChart: canvas } = getDom();
-  if (!canvas || typeof Chart === "undefined") return;
-  const okColor = cssVar("--ok", "#34d399");
-  const offColor = cssVar("--danger", "#f87171");
-  const muted = cssVar("--muted", "#8b9bb8");
-  const tip = fleetTooltipStyle();
-  const xBounds = fleetXBounds();
-  const online = (points || []).map((p) => ({ x: p.t * 1000, y: p.online }));
-  const offline = (points || []).map((p) => ({ x: p.t * 1000, y: p.offline }));
-  const datasets = [
-    {
-      label: "Online",
-      data: online,
-      borderColor: okColor,
-      backgroundColor: okColor + "28",
-      borderWidth: 2.25,
-      pointRadius: 0,
-      pointHoverRadius: 3,
-      tension: 0.35,
-      fill: "origin",
-      order: 2,
-    },
-    {
-      label: "Offline",
-      data: offline,
-      borderColor: offColor,
-      backgroundColor: offColor + "18",
-      borderWidth: 2,
-      pointRadius: 0,
-      pointHoverRadius: 3,
-      tension: 0.35,
-      fill: "origin",
-      order: 1,
-    },
-  ];
+  const map = L.map(fleetMapCanvas, {
+    worldCopyJump: true,
+    zoomControl: true,
+    attributionControl: true,
+  }).setView([20, 0], 2);
 
-  const scaleOpts = {
-    x: {
-      type: "linear",
-      min: xBounds.min,
-      max: xBounds.max,
-      ticks: {
-        color: muted,
-        callback: (v) => tsLabel(v / 1000, state.rangeId),
-        autoSkip: true,
-        maxTicksLimit: 5,
-        maxRotation: 0,
-        padding: 8,
-        font: { size: 10 },
-      },
-      grid: { display: false, drawBorder: false, drawTicks: false },
-      border: { display: false },
-    },
-    y: {
-      beginAtZero: true,
-      grace: "8%",
-      ticks: {
-        color: muted,
-        precision: 0,
-        stepSize: 1,
-        maxTicksLimit: 5,
-        padding: 10,
-        font: { size: 10 },
-      },
-      grid: {
-        color: fleetGridColor(),
-        lineWidth: 1,
-        drawBorder: false,
-        drawTicks: false,
-      },
-      border: { display: false },
-    },
-  };
-
-  // Always recreate so theme switches (dark ↔ light) fully refresh tooltip colors.
-  destroyFleetHealthChart();
-  state.fleetHealthChart = new Chart(canvas, {
-    type: "line",
-    data: { datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      parsing: false,
-      layout: { padding: { top: 6, right: 10, bottom: 2, left: 2 } },
-      interaction: { mode: "index", intersect: false },
-      plugins: {
-        legend: {
-          display: true,
-          position: "bottom",
-          align: "start",
-          labels: {
-            boxWidth: 8,
-            boxHeight: 8,
-            usePointStyle: true,
-            pointStyle: "circle",
-            padding: 14,
-            font: { size: 11 },
-            color: muted,
-          },
-        },
-        tooltip: {
-          ...tip,
-          callbacks: {
-            title: (items) => {
-              const x = items[0]?.parsed?.x;
-              return x == null ? "" : new Date(x).toLocaleString();
-            },
-            label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y}`,
-            labelTextColor: () => tip.bodyColor,
-          },
-        },
-      },
-      scales: scaleOpts,
-    },
+  const tiles = L.tileLayer(mapTileUrl(), {
+    maxZoom: 8,
+    minZoom: 1,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
   });
+  tiles.addTo(map);
+
+  const links = L.layerGroup().addTo(map);
+  const markers = L.layerGroup().addTo(map);
+  state.fleetMap = map;
+  state.fleetMapTileLayer = tiles;
+  state.fleetMapLinks = links;
+  state.fleetMapMarkers = markers;
+
+  // Leaflet needs a size refresh after becoming visible.
+  setTimeout(() => {
+    try { map.invalidateSize(); } catch (_) { /* ignore */ }
+  }, 50);
+
+  return map;
 }
 
+function syncFleetMapTiles() {
+  if (!state.fleetMap || !state.fleetMapTileLayer) return;
+  try {
+    state.fleetMap.removeLayer(state.fleetMapTileLayer);
+  } catch (_) { /* ignore */ }
+  const tiles = L.tileLayer(mapTileUrl(), {
+    maxZoom: 8,
+    minZoom: 1,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+  });
+  tiles.addTo(state.fleetMap);
+  state.fleetMapTileLayer = tiles;
+}
+
+function clusterRootId(a, byId) {
+  const parentId = a.parent_appliance_id != null ? Number(a.parent_appliance_id) : null;
+  if (parentId && byId.has(parentId)) return parentId;
+  if (a.is_clustered || a.cluster_role === "primary") return Number(a.id);
+  return null;
+}
+
+/** Spread co-located nodes so online/offline dots don't stack into one pin. */
+function offsetCoLocated(lat, lng, index, total) {
+  if (total <= 1) return [lat, lng];
+  // ~0.35° ring — visible at continent zoom without looking far apart.
+  const radius = 0.35;
+  const angle = (2 * Math.PI * index) / total - Math.PI / 2;
+  const latRad = (lat * Math.PI) / 180;
+  const dLat = radius * Math.cos(angle);
+  const dLng = (radius * Math.sin(angle)) / Math.max(Math.cos(latRad), 0.2);
+  return [lat + dLat, lng + dLng];
+}
+
+/** Display lat/lng per appliance (includes co-location offsets). Shared by dots + cluster lines. */
+function computeMapPositions() {
+  /** @type {Map<string, any[]>} */
+  const groups = new Map();
+  for (const a of state.appliances || []) {
+    if (!a.location_mapped || a.location_lat == null || a.location_lng == null) continue;
+    const key = `${a.location_lat},${a.location_lng}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(a);
+  }
+
+  /** @type {Map<number, {lat:number,lng:number,appliance:any}>} */
+  const positions = new Map();
+  for (const items of groups.values()) {
+    items.forEach((a, index) => {
+      const [lat, lng] = offsetCoLocated(
+        Number(a.location_lat),
+        Number(a.location_lng),
+        index,
+        items.length
+      );
+      positions.set(Number(a.id), { lat, lng, appliance: a });
+    });
+  }
+  return positions;
+}
+
+function paintClusterLinks(byId, positions) {
+  if (!state.fleetMapLinks) return;
+  state.fleetMapLinks.clearLayers();
+
+  const isLight = currentTheme() === "light";
+  const lineColor = isLight ? "#2563eb" : "#60a5fa";
+
+  /** @type {Map<number, number[]>} clusterRoot -> appliance ids with map positions */
+  const clusterMembers = new Map();
+  for (const [id, pos] of positions) {
+    const a = pos.appliance;
+    const root = clusterRootId(a, byId);
+    if (!root) continue;
+    if (!clusterMembers.has(root)) clusterMembers.set(root, []);
+    clusterMembers.get(root).push(id);
+  }
+
+  for (const [rootId, memberIds] of clusterMembers) {
+    if (memberIds.length < 2) continue;
+    const hubPos = positions.get(rootId) || positions.get(memberIds[0]);
+    if (!hubPos) continue;
+
+    for (const id of memberIds) {
+      if (id === rootId) continue;
+      const pos = positions.get(id);
+      if (!pos) continue;
+      if (pos.lat === hubPos.lat && pos.lng === hubPos.lng) continue;
+      const line = L.polyline(
+        [
+          [hubPos.lat, hubPos.lng],
+          [pos.lat, pos.lng],
+        ],
+        {
+          color: lineColor,
+          weight: 2,
+          opacity: 0.75,
+          dashArray: "6 6",
+          interactive: false,
+        }
+      );
+      state.fleetMapLinks.addLayer(line);
+    }
+  }
+}
+
+function paintFleetMap() {
+  const map = ensureFleetMap();
+  if (!map || !state.fleetMapMarkers) return;
+
+  state.fleetMapMarkers.clearLayers();
+  if (state.fleetMapLinks) state.fleetMapLinks.clearLayers();
+
+  const byId = new Map((state.appliances || []).map((a) => [Number(a.id), a]));
+  const positions = computeMapPositions();
+  paintClusterLinks(byId, positions);
+
+  const bounds = [];
+  for (const [id, pos] of positions) {
+    const a = pos.appliance;
+    const tone = applianceMapTone(a);
+    const name = a.display_name || shortHostOf(a);
+    const locLabel = a.location_label || a.location || "Location";
+    // Larger icon box so the online ping rings aren't clipped by Leaflet.
+    const markerHtml =
+      tone === "online"
+        ? `<div class="fleet-map-marker-wrap is-online" title="${escapeHtml(name)}"><span class="fleet-map-ping" aria-hidden="true"></span><span class="fleet-map-ping fleet-map-ping-delay" aria-hidden="true"></span><div class="fleet-map-marker online"></div></div>`
+        : `<div class="fleet-map-marker-wrap" title="${escapeHtml(name)}"><div class="fleet-map-marker ${tone}"></div></div>`;
+    const icon = L.divIcon({
+      className: "fleet-map-icon",
+      html: markerHtml,
+      iconSize: [36, 36],
+      iconAnchor: [18, 18],
+    });
+    const html = `<div class="fleet-map-popup"><strong>${escapeHtml(name)}</strong>
+        <div class="muted">${escapeHtml(locLabel)} · ${tone}</div>
+        <button type="button" data-appliance-id="${id}">Open Overview</button></div>`;
+    const marker = L.marker([pos.lat, pos.lng], { icon }).bindPopup(html);
+    marker.on("popupopen", (ev) => {
+      const el = ev.popup.getElement();
+      el?.querySelectorAll("[data-appliance-id]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const aid = Number(btn.getAttribute("data-appliance-id"));
+          if (!aid) return;
+          await selectAppliance(aid);
+          if (typeof openOverview === "function") await openOverview();
+        });
+      });
+    });
+    state.fleetMapMarkers.addLayer(marker);
+    bounds.push([pos.lat, pos.lng]);
+  }
+
+  setTimeout(() => {
+    try {
+      map.invalidateSize();
+      if (bounds.length === 1) {
+        map.setView(bounds[0], 4);
+      } else if (bounds.length > 1) {
+        map.fitBounds(bounds, { padding: [36, 36], maxZoom: 5 });
+      } else {
+        map.setView([20, 0], 2);
+      }
+    } catch (_) { /* ignore */ }
+  }, 40);
+}
+
+/** Render the Appliances-tab world map (replaces former fleet health chart). */
 export async function renderFleetHealth() {
-  const { fleetHealth, fleetHealthSummary } = getDom();
-  if (!fleetHealth) return;
+  const { fleetMap, fleetMapSummary } = getDom();
+  if (!fleetMap) return;
   if (state.viewMode !== "appliances") {
-    fleetHealth.hidden = true;
-    destroyFleetHealthChart();
+    fleetMap.hidden = true;
     return;
   }
-  fleetHealth.hidden = false;
-  try {
-    const data = await fetchJSON(
-      `/api/fleet-health?range=${encodeURIComponent(state.rangeId)}`
-    );
-    if (state.viewMode !== "appliances") return;
-    const latest = data.latest || {};
-    const online = latest.online ?? 0;
-    const offline = latest.offline ?? 0;
-    const total = latest.total ?? online + offline;
-    if (fleetHealthSummary) {
-      fleetHealthSummary.textContent =
-        `${online} online · ${offline} offline · ${total} total · last ${data.range || state.rangeId}`;
-    }
-    paintFleetHealthChart(data.points || []);
-  } catch (_) {
-    if (fleetHealthSummary) {
-      fleetHealthSummary.textContent = "Could not load fleet health history";
-    }
+  fleetMap.hidden = false;
+
+  const list = state.appliances || [];
+  let online = 0;
+  let offline = 0;
+  let unmapped = 0;
+  for (const a of list) {
+    const tone = applianceMapTone(a);
+    if (tone === "online") online += 1;
+    else offline += 1;
+    if (!a.location_mapped) unmapped += 1;
   }
+  if (fleetMapSummary) {
+    fleetMapSummary.textContent =
+      `${online} online · ${offline} offline` +
+      (unmapped ? ` · ${unmapped} unmapped` : "") +
+      (list.length ? ` · ${list.length} total` : "");
+  }
+
+  if (typeof L === "undefined") {
+    if (fleetMapSummary) {
+      fleetMapSummary.textContent = "Map library failed to load";
+    }
+    return;
+  }
+
+  if (state.fleetMap) {
+    syncFleetMapTiles();
+  }
+  paintFleetMap();
 }
 
 export function renderApplianceTree() {
@@ -725,7 +807,7 @@ export async function submitEditForm(e) {
     body.cluster_display_name = String(fd.get("cluster_display_name") || "").trim();
   } else {
     body.display_name = String(fd.get("display_name") || "").trim();
-    body.location = String(fd.get("location") || "").trim();
+    body.location = readLocationKey(editForm);
   }
   if (btnEditSave) {
     btnEditSave.disabled = true;

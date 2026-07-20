@@ -138,7 +138,7 @@ export function renderSecondaryChips() {
 }
 
 export function syncWorkspaceChrome() {
-  const { secondaryRow, appliancesView, panelsEl, fleetHealth, healthcheckView } = getDom();
+  const { secondaryRow, appliancesView, panelsEl, fleetMap, healthcheckView } = getDom();
   const appliancesMode = state.viewMode === "appliances";
   const healthcheckMode = state.viewMode === "healthcheck";
   if (secondaryRow) secondaryRow.classList.toggle("is-hidden", appliancesMode || healthcheckMode);
@@ -162,7 +162,7 @@ export function syncWorkspaceChrome() {
     if (!healthcheckMode) {
       state.groupId = groupForDashboard(state.dashboardId);
     }
-    if (fleetHealth) fleetHealth.hidden = true;
+    if (fleetMap) fleetMap.hidden = true;
   }
   renderPrimaryTabs();
   renderSecondaryChips();

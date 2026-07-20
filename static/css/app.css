@@ -481,7 +481,7 @@ code {
   color: var(--text);
 }
 
-.fleet-health {
+.fleet-map {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -491,37 +491,265 @@ code {
   background: var(--panel-grad);
 }
 
-.fleet-health[hidden] {
+.fleet-map[hidden] {
   display: none !important;
 }
 
-.fleet-health-head {
+.fleet-map-head {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
   gap: 12px;
 }
 
-.fleet-health-title {
+.fleet-map-title {
   font-size: 14px;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
 
-.fleet-health-sub {
+.fleet-map-sub {
   margin: 2px 0 0;
   font-size: 12px;
 }
 
-.fleet-health-chart-wrap {
+.fleet-map-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fleet-map-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fleet-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--panel) 70%, transparent);
+}
+
+.fleet-dot.online {
+  background: var(--ok, #34d399);
+}
+
+.fleet-dot.offline {
+  background: var(--danger, #f87171);
+}
+
+.fleet-dot.pending {
+  background: #fbbf24;
+}
+
+.fleet-link-sample {
+  width: 18px;
+  height: 0;
+  border-top: 2px dashed #60a5fa;
+  display: inline-block;
+}
+
+html[data-theme="light"] .fleet-link-sample {
+  border-top-color: #2563eb;
+}
+
+.fleet-map-canvas-wrap {
   position: relative;
   width: 100%;
-  height: 200px;
-  min-height: 180px;
-  /* Soft plot area — no hard spreadsheet frame around the canvas */
+  height: 280px;
+  min-height: 240px;
   border-radius: 12px;
+  overflow: hidden;
   background: color-mix(in srgb, var(--bg) 55%, transparent);
-  padding: 4px 2px 0;
+}
+
+#fleet-map-canvas {
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+}
+
+#fleet-map-canvas .leaflet-container {
+  font-family: inherit;
+  background: transparent;
+}
+
+/* Leaflet clips overflow on marker icons — keep ping inside a 36×36 box. */
+.fleet-map-icon.leaflet-div-icon,
+.fleet-map-icon {
+  background: transparent !important;
+  border: none !important;
+  overflow: visible !important;
+}
+
+#fleet-map-canvas .leaflet-marker-pane,
+#fleet-map-canvas .leaflet-marker-icon {
+  overflow: visible !important;
+}
+
+.fleet-map-marker-wrap {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+}
+
+.fleet-map-marker {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+}
+
+.fleet-map-marker.online {
+  background: var(--ok, #34d399);
+}
+
+.fleet-map-marker.offline {
+  background: var(--danger, #f87171);
+}
+
+.fleet-map-marker.pending {
+  background: #fbbf24;
+}
+
+/* Expanding radar rings (online only) — solid green dot stays steady */
+.fleet-map-ping {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ok, #34d399) 30%, transparent);
+  border: 2px solid var(--ok, #34d399);
+  box-sizing: border-box;
+  pointer-events: none;
+  z-index: 1;
+  transform-origin: center center;
+  animation: fleet-map-ping 1.6s ease-out infinite !important;
+}
+
+.fleet-map-ping-delay {
+  animation-delay: 0.7s !important;
+}
+
+@keyframes fleet-map-ping {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fleet-map-ping {
+    animation-duration: 2.6s !important;
+  }
+}
+
+.fleet-map-popup {
+  font-size: 12px;
+  line-height: 1.4;
+  min-width: 140px;
+}
+
+.fleet-map-popup strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.fleet-map-popup button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-top: 4px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent, #3b82f6) 16%, transparent);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.fleet-map-popup button:hover {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 28%, transparent);
+}
+
+.location-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.location-fields[hidden] {
+  display: none !important;
+}
+
+.location-autocomplete {
+  position: relative;
+  margin: 0;
+}
+
+.location-suggestions {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 4px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel, var(--bg));
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+}
+
+.location-suggestions[hidden] {
+  display: none !important;
+}
+
+.location-suggestion {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.location-suggestion:hover,
+.location-suggestion.is-active {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 18%, transparent);
+}
+
+.location-suggestion-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.location-hint,
+.location-previous-note {
+  margin: 0;
+  font-size: 12px;
 }
 
 .secondary-chips {
@@ -1782,7 +2010,8 @@ code {
 
 .modal input[type="text"],
 .modal input[type="password"],
-.modal input:not([type]) {
+.modal input:not([type]),
+.modal select {
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
@@ -1791,6 +2020,12 @@ code {
   font: inherit;
   font-size: 14px;
   font-weight: 400;
+  width: 100%;
+}
+
+.modal select {
+  cursor: pointer;
+  appearance: auto;
 }
 
 @media (max-width: 520px) {
@@ -1799,7 +2034,8 @@ code {
   }
 }
 
-.modal input:focus {
+.modal input:focus,
+.modal select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);

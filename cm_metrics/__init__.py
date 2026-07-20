@@ -15,6 +15,7 @@ from .client import CMClientError
 from .config import Config
 from .dashboards import get_dashboard, list_dashboard_groups, list_dashboards
 from . import healthcheck_runner
+from .locations import locations_api_payload, normalize_location_key
 from .scraper import MetricsScraper
 from .store import MetricsStore
 
@@ -52,6 +53,11 @@ def create_app() -> Flask:
 
     # ---- Appliances -----------------------------------------------------
 
+    @app.get("/api/locations")
+    def api_list_locations():
+        """Curated country/region catalog for dropdowns and the fleet map."""
+        return jsonify(locations_api_payload())
+
     @app.get("/api/appliances")
     def api_list_appliances():
         appliances = db.list_appliances()
@@ -76,11 +82,15 @@ def create_app() -> Flask:
         username = (payload.get("username") or "").strip()
         password = payload.get("password") or ""
         display_name = (payload.get("display_name") or "").strip() or None
-        location = (payload.get("location") or "").strip() or None
         discover = bool(payload.get("discover_cluster", True))
 
         if not host or not username or not password:
             return jsonify({"error": "host, username, and password are required"}), 400
+
+        try:
+            location = normalize_location_key(payload.get("location"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
         try:
             result = scraper.connect_appliance(
@@ -196,9 +206,12 @@ def create_app() -> Flask:
             if not updated:
                 return jsonify({"error": "not found"}), 404
         if "location" in payload:
-            updated = db.update_appliance_location(
-                appliance_id, str(payload.get("location") or "")
-            )
+            try:
+                updated = db.update_appliance_location(
+                    appliance_id, str(payload.get("location") or "")
+                )
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
             if not updated:
                 return jsonify({"error": "not found"}), 404
         appliance = updated or db.get_appliance(appliance_id)

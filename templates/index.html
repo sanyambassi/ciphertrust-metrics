@@ -17,8 +17,10 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=20260720attach1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v=20260720ping4" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 </head>
 <body>
   <div class="app workspace" id="app-shell">
@@ -103,25 +105,20 @@
           </div>
           <button type="button" class="btn btn-primary btn-sm" id="btn-add-tree" title="Add appliance">Add appliance</button>
         </div>
-        <div class="fleet-health" id="fleet-health" aria-label="Fleet health over time" hidden>
-          <div class="fleet-health-head">
+        <div class="fleet-map" id="fleet-map" aria-label="Fleet locations map" hidden>
+          <div class="fleet-map-head">
             <div>
-              <div class="fleet-health-title">Fleet health</div>
-              <div class="muted fleet-health-sub" id="fleet-health-summary">Online / offline over time</div>
+              <div class="fleet-map-title">Fleet map</div>
+              <div class="muted fleet-map-sub" id="fleet-map-summary">Online / offline by location</div>
             </div>
-            <div class="range-picker fleet-range-picker" id="fleet-range-picker" role="group" aria-label="Fleet health time range">
-              <button type="button" class="range-btn" data-range="5m">5m</button>
-              <button type="button" class="range-btn" data-range="15m">15m</button>
-              <button type="button" class="range-btn" data-range="30m">30m</button>
-              <button type="button" class="range-btn" data-range="1h">1h</button>
-              <button type="button" class="range-btn" data-range="6h">6h</button>
-              <button type="button" class="range-btn active" data-range="24h">24h</button>
-              <button type="button" class="range-btn" data-range="7d">7d</button>
-              <button type="button" class="range-btn" data-range="30d">30d</button>
+            <div class="fleet-map-legend" aria-hidden="true">
+              <span class="fleet-map-legend-item"><span class="fleet-dot online"></span> Online</span>
+              <span class="fleet-map-legend-item"><span class="fleet-dot offline"></span> Offline</span>
+              <span class="fleet-map-legend-item"><span class="fleet-link-sample"></span> Cluster link</span>
             </div>
           </div>
-          <div class="fleet-health-chart-wrap">
-            <canvas id="fleet-health-chart" aria-label="Online and offline appliance counts"></canvas>
+          <div class="fleet-map-canvas-wrap">
+            <div id="fleet-map-canvas" role="img" aria-label="World map of appliances"></div>
           </div>
         </div>
         <div class="appliance-tree" id="appliance-tree" role="tree" aria-label="Appliances"></div>
@@ -154,9 +151,14 @@
         <label>Display name <span class="optional">(optional)</span>
           <input name="display_name" placeholder="Prod CM" />
         </label>
-        <label>Location <span class="optional">(optional)</span>
-          <input name="location" placeholder="Ashburn, VA / Azure East US" autocomplete="off" />
-        </label>
+        <div class="location-fields" id="connect-location-fields">
+          <input type="hidden" name="location" value="" />
+          <p class="muted location-hint">Optional. Applies to this node only (not the cluster). Type to search states, provinces, or regions.</p>
+          <label class="location-autocomplete">Location <span class="optional">(optional)</span>
+            <input name="location_search" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. London, Bengaluru, California…" />
+            <ul class="location-suggestions" role="listbox" hidden></ul>
+          </label>
+        </div>
         <label class="check">
           <input type="checkbox" name="discover_cluster" checked />
           Auto-discover &amp; add clustered nodes
@@ -181,9 +183,15 @@
         <label id="edit-name-label">Display name
           <input name="display_name" placeholder="Prod CM" autocomplete="off" />
         </label>
-        <label id="edit-location-wrap">Location <span class="optional">(optional)</span>
-          <input name="location" placeholder="Ashburn, VA / Azure East US" autocomplete="off" />
-        </label>
+        <div id="edit-location-wrap" class="location-fields" hidden>
+          <input type="hidden" name="location" value="" />
+          <p class="muted location-hint">Optional. Per node only — clusters do not have a location.</p>
+          <p class="muted location-previous-note" hidden></p>
+          <label class="location-autocomplete">Location <span class="optional">(optional)</span>
+            <input name="location_search" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. London, Bengaluru, California…" />
+            <ul class="location-suggestions" role="listbox" hidden></ul>
+          </label>
+        </div>
         <div class="form-error" id="edit-form-error" hidden></div>
         <div class="modal-actions">
           <button type="button" class="btn" id="btn-edit-cancel">Cancel</button>
@@ -201,6 +209,6 @@
       dashboardGroups: {{ dashboard_groups | tojson }}
     };
   </script>
-  <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=20260720attach1"></script>
+  <script type="module" src="{{ url_for('static', filename='js/main.js') }}?v=20260720ping4"></script>
 </body>
 </html>

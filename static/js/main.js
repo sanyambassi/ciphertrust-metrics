@@ -40,7 +40,7 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js?v=20260720attach1";
+} from "./dashboard.js?v=20260720ping2";
 
 const dom = getDom();
 const {
@@ -118,14 +118,6 @@ secondaryChips?.addEventListener("click", (e) => {
 });
 
 document.getElementById("range-picker")?.addEventListener("click", (e) => {
-  const btn = e.target.closest("[data-range]");
-  if (!btn) return;
-  const rangeId = btn.dataset.range;
-  if (!rangeId || rangeId === state.rangeId) return;
-  setTimeRange(rangeId, { reload: true });
-});
-
-document.getElementById("fleet-range-picker")?.addEventListener("click", (e) => {
   const btn = e.target.closest("[data-range]");
   if (!btn) return;
   const rangeId = btn.dataset.range;
@@ -255,7 +247,7 @@ form.addEventListener("submit", async (e) => {
     username: fd.get("username"),
     password: fd.get("password"),
     display_name: fd.get("display_name") || undefined,
-    location: fd.get("location") || undefined,
+    location: String(fd.get("location") || "").trim() || undefined,
     discover_cluster: fd.get("discover_cluster") === "on",
   };
   try {
