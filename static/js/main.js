@@ -40,7 +40,7 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js?v=20260720locfix1";
+} from "./dashboard.js?v=20260720mapflash1";
 
 const dom = getDom();
 const {

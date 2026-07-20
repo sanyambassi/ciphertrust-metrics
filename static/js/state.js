@@ -23,6 +23,11 @@ export const state = {
   fleetMapTileLayer: null,
   fleetMapMarkers: null,
   fleetMapLinks: null,
+  /** Signature of last painted map markers — skip redraw when unchanged. */
+  fleetMapSig: null,
+  /** True after the first fitBounds for the current marker set. */
+  fleetMapFitted: false,
+  fleetMapTheme: null,
   /** Appliance ids currently syncing via per-node Sync button. */
   syncingApplianceIds: new Set(),
 };

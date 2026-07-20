@@ -420,6 +420,27 @@ function destroyFleetMap() {
   state.fleetMapTileLayer = null;
   state.fleetMapMarkers = null;
   state.fleetMapLinks = null;
+  state.fleetMapSig = null;
+  state.fleetMapFitted = false;
+  state.fleetMapTheme = null;
+}
+
+function fleetMapSignature() {
+  const positions = computeMapPositions();
+  const rows = [];
+  for (const [id, pos] of positions) {
+    rows.push([
+      id,
+      Number(pos.lat.toFixed(5)),
+      Number(pos.lng.toFixed(5)),
+      applianceMapTone(pos.appliance),
+      pos.appliance.location || "",
+      pos.appliance.parent_appliance_id || "",
+    ]);
+  }
+  rows.sort((a, b) => a[0] - b[0]);
+  // Theme affects tile style + cluster line color.
+  return JSON.stringify({ theme: currentTheme(), markers: rows });
 }
 
 function mapTileUrl() {
@@ -459,17 +480,21 @@ function ensureFleetMap() {
   state.fleetMapTileLayer = tiles;
   state.fleetMapLinks = links;
   state.fleetMapMarkers = markers;
+  state.fleetMapTheme = currentTheme();
+  state.fleetMapFitted = false;
 
   // Leaflet needs a size refresh after becoming visible.
   setTimeout(() => {
-    try { map.invalidateSize(); } catch (_) { /* ignore */ }
+    try { map.invalidateSize({ animate: false }); } catch (_) { /* ignore */ }
   }, 50);
 
   return map;
 }
 
-function syncFleetMapTiles() {
+function syncFleetMapTiles({ force = false } = {}) {
   if (!state.fleetMap || !state.fleetMapTileLayer) return;
+  const theme = currentTheme();
+  if (!force && state.fleetMapTheme === theme) return;
   try {
     state.fleetMap.removeLayer(state.fleetMapTileLayer);
   } catch (_) { /* ignore */ }
@@ -480,6 +505,7 @@ function syncFleetMapTiles() {
   });
   tiles.addTo(state.fleetMap);
   state.fleetMapTileLayer = tiles;
+  state.fleetMapTheme = theme;
 }
 
 function clusterRootId(a, byId) {
@@ -515,6 +541,8 @@ function computeMapPositions() {
   /** @type {Map<number, {lat:number,lng:number,appliance:any}>} */
   const positions = new Map();
   for (const items of groups.values()) {
+    // Stable order so auto-refresh reordering doesn't reshuffle offsets.
+    items.sort((a, b) => Number(a.id) - Number(b.id));
     items.forEach((a, index) => {
       const [lat, lng] = offsetCoLocated(
         Number(a.location_lat),
@@ -573,9 +601,18 @@ function paintClusterLinks(byId, positions) {
   }
 }
 
-function paintFleetMap() {
+function paintFleetMap({ forceFit = false } = {}) {
   const map = ensureFleetMap();
   if (!map || !state.fleetMapMarkers) return;
+
+  const sig = fleetMapSignature();
+  if (!forceFit && sig === state.fleetMapSig) {
+    // Markers unchanged — don't clear/rebuild (that caused the flash).
+    try { map.invalidateSize({ animate: false }); } catch (_) { /* ignore */ }
+    return;
+  }
+  const shouldFit = forceFit || !state.fleetMapFitted || state.fleetMapSig == null;
+  state.fleetMapSig = sig;
 
   state.fleetMapMarkers.clearLayers();
   if (state.fleetMapLinks) state.fleetMapLinks.clearLayers();
@@ -622,14 +659,16 @@ function paintFleetMap() {
 
   setTimeout(() => {
     try {
-      map.invalidateSize();
+      map.invalidateSize({ animate: false });
+      if (!shouldFit) return;
       if (bounds.length === 1) {
-        map.setView(bounds[0], 4);
+        map.setView(bounds[0], 4, { animate: false });
       } else if (bounds.length > 1) {
-        map.fitBounds(bounds, { padding: [36, 36], maxZoom: 5 });
+        map.fitBounds(bounds, { padding: [36, 36], maxZoom: 5, animate: false });
       } else {
-        map.setView([20, 0], 2);
+        map.setView([20, 0], 2, { animate: false });
       }
+      state.fleetMapFitted = true;
     } catch (_) { /* ignore */ }
   }, 40);
 }
@@ -668,9 +707,8 @@ export async function renderFleetHealth() {
     return;
   }
 
-  if (state.fleetMap) {
-    syncFleetMapTiles();
-  }
+  // Only swap tiles on theme change — reloading tiles every poll flashed the map.
+  syncFleetMapTiles();
   paintFleetMap();
 }
 
@@ -724,6 +762,7 @@ export function renderApplianceList(force = false) {
         }
         if (status) status.className = `tree-node-status ${info.cls}`;
       });
+      // Summary text only — paintFleetMap skips when marker signature is unchanged.
       renderFleetHealth();
     }
     if (state.menuOpen) renderApplianceMenu();
