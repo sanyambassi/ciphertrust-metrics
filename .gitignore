@@ -29,6 +29,12 @@ _*.json
 _res_out*
 docs/screenshots-review/
 
+# Local test / verification / traffic helpers (not product code)
+scripts/test_*.py
+scripts/verify_*.py
+scripts/*_live_traffic*
+scripts/crdp_live_traffic*
+
 # IDE
 .cursor/
 .idea/
