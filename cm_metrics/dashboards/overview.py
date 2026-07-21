@@ -142,13 +142,13 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
             users_total,
             description=users_ops.get("error") or "",
             link_dashboard="resources-domains",
-            link_label="View Domains",
+            link_label="View Domains & Users",
         ),
         _stat(
             "Domains",
             subdomains,
             link_dashboard="resources-domains",
-            link_label="View Domains",
+            link_label="View Domains & Users",
         ),
         _stat(
             "HSM Sessions",
@@ -192,7 +192,7 @@ def build_overview(store: ApplianceStore, appliance: dict[str, Any] | None = Non
             "",
             "Ranked by logins_count (root domain)",
             link_dashboard="resources-domains",
-            link_label="View Domains",
+            link_label="View Domains & Users",
         ),
         _timeseries(
             "Memory Available",
