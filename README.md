@@ -52,7 +52,7 @@ Open **http://localhost:5050** → **Appliances** → add a CM (host, username, 
 | Item | Detail |
 |------|--------|
 | Image | [`sanyambassi/ciphertrust-metrics`](https://hub.docker.com/r/sanyambassi/ciphertrust-metrics) |
-| Tags | `latest`, `1.1.0` |
+| Tags | `latest`, `1.2.0` |
 | Port | `5050` (HTTP by default in the image) |
 | Data volume | `/app/data` — SQLite DB, optional TLS certs, healthcheck reports |
 | Platform | `linux/amd64` (Apple Silicon usually runs via emulation) |

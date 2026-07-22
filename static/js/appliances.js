@@ -516,21 +516,20 @@ function redrawPlaceHtmlLabels() {
 
 /**
  * Oceans: always on (both themes). Continents: world zoom, English overlays.
- * Zoomed-in dark: Esri reference place labels. Light uses unlabeled Voyager.
+ * Zoomed in: tile place labels (light = Voyager only_labels, dark = Esri ref).
  */
 function syncFleetPlaceLabels() {
   const map = state.fleetMap;
   if (!map) return;
   const zoom = map.getZoom();
   const continentView = zoom <= MAP_CONTINENT_LABEL_MAX_ZOOM;
-  const dark = currentTheme() !== "light";
 
   redrawPlaceHtmlLabels();
 
   const labels = state.fleetMapLabelLayer;
   if (!labels) return;
   try {
-    const showTileLabels = dark && !continentView;
+    const showTileLabels = !continentView;
     if (showTileLabels) {
       if (!map.hasLayer(labels)) labels.addTo(map);
     } else if (map.hasLayer(labels)) {
@@ -581,14 +580,16 @@ function fleetMapSignature() {
 }
 
 /**
- * Light: Carto Voyager without labels (blue oceans; multilingual OSM names removed).
- * Dark: Esri Dark Gray — the look we had before the blue-water experiment.
+ * Light: Voyager nolabels base (blue oceans) + only_labels when zoomed in
+ * (avoids multilingual continent stacks at world zoom).
+ * Dark: Esri Dark Gray + reference labels when zoomed in.
  */
 function mapBasemapSpec() {
   if (currentTheme() === "light") {
     return {
       base: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}{r}.png",
-      labels: null,
+      labels:
+        "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png",
       subdomains: "abcd",
       oceanTone: "light",
       attribution:

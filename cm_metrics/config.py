@@ -42,7 +42,7 @@ def _ensure_secret() -> str:
 
 class Config:
     # Bump on each Docker/GitHub release (semver: MAJOR.MINOR.PATCH).
-    APP_VERSION: str = os.getenv("APP_VERSION", "1.1.0")
+    APP_VERSION: str = os.getenv("APP_VERSION", "1.2.0")
     SECRET_KEY: str = _ensure_secret()
     DATABASE_PATH: Path = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "cm_metrics.db")))
     # Per-appliance metric SQLite files live here (metric_points + scrape_runs).
