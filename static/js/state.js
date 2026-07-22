@@ -23,6 +23,7 @@ export const state = {
   fleetMapTileLayer: null,
   fleetMapLabelLayer: null,
   fleetMapContinents: null,
+  fleetMapOceans: null,
   fleetMapMarkers: null,
   fleetMapLinks: null,
   /** Signature of last painted map markers — skip redraw when unchanged. */

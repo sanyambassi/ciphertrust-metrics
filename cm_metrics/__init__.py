@@ -49,6 +49,7 @@ def create_app() -> Flask:
             dashboard_groups=list_dashboard_groups(),
             scrape_interval=Config.SCRAPE_INTERVAL,
             appliance_count=db.appliance_count(),
+            app_version=Config.APP_VERSION,
         )
 
     # ---- Appliances -----------------------------------------------------
@@ -492,6 +493,10 @@ def create_app() -> Flask:
 
     @app.get("/api/health")
     def api_health():
-        return jsonify({"ok": True, "appliances": db.appliance_count()})
+        return jsonify({
+            "ok": True,
+            "appliances": db.appliance_count(),
+            "version": Config.APP_VERSION,
+        })
 
     return app

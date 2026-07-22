@@ -134,6 +134,8 @@ code {
   color: var(--muted);
   font-size: 11px;
   margin-top: 1px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
 }
 
 .appliance-rail {
@@ -564,7 +566,12 @@ html[data-theme="light"] .fleet-link-sample {
   min-height: 380px;
   border-radius: 12px;
   overflow: hidden;
-  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  /* Match ocean tile color so empty map edges aren't Leaflet's default gray (#ddd) */
+  background: #9ec9e6 !important;
+}
+
+html:not([data-theme="light"]) .fleet-map-canvas-wrap {
+  background: #1a1a1a !important;
 }
 
 @media (max-width: 720px) {
@@ -578,11 +585,36 @@ html[data-theme="light"] .fleet-link-sample {
   width: 100%;
   height: 100%;
   z-index: 0;
+  background: #9ec9e6 !important;
 }
 
-#fleet-map-canvas .leaflet-container {
+html:not([data-theme="light"]) #fleet-map-canvas {
+  background: #1a1a1a !important;
+}
+
+#fleet-map-canvas .leaflet-container,
+#fleet-map-canvas .leaflet-container .leaflet-pane,
+#fleet-map-canvas .leaflet-container .leaflet-map-pane,
+#fleet-map-canvas .leaflet-container .leaflet-tile-pane {
   font-family: inherit;
-  background: transparent;
+  background: #9ec9e6 !important;
+}
+
+html:not([data-theme="light"]) #fleet-map-canvas .leaflet-container,
+html:not([data-theme="light"]) #fleet-map-canvas .leaflet-container .leaflet-pane,
+html:not([data-theme="light"]) #fleet-map-canvas .leaflet-container .leaflet-map-pane,
+html:not([data-theme="light"]) #fleet-map-canvas .leaflet-container .leaflet-tile-pane {
+  background: #1a1a1a !important;
+}
+
+/* Esri dark-gray reference labels — slight lift for readability (pre-blue-water look) */
+html:not([data-theme="light"]) #fleet-map-canvas.is-ocean-dark .leaflet-tile-pane {
+  filter: none;
+}
+
+html:not([data-theme="light"]) #fleet-map-canvas.is-ocean-dark .leaflet-pane.fleetLabels {
+  filter: brightness(1.35) contrast(1.15);
+  opacity: 1;
 }
 
 /* Readable place names + controls on dark basemap */
@@ -639,22 +671,26 @@ html[data-theme="light"] .fleet-link-sample {
   color: var(--text);
 }
 
-html:not([data-theme="light"]) #fleet-map-canvas .leaflet-pane.fleetLabels {
-  /* Brighten Esri reference labels so place names stay readable */
-  filter: brightness(1.55) contrast(1.25) saturate(1.1);
+/* Place-name overlays sit above the Leaflet canvas (avoids GPU marker compositing gaps). */
+.fleet-place-html-labels {
+  position: absolute;
+  inset: 0;
+  /* Above tile/overlay panes (~200–400); below marker pane (600). */
+  z-index: 450;
+  pointer-events: none;
+  overflow: hidden;
 }
 
-.fleet-continent-label-icon.leaflet-div-icon,
-.fleet-continent-label-icon {
-  background: transparent !important;
-  border: none !important;
-  overflow: visible !important;
+.fleet-place-html-labels .fleet-continent-label,
+.fleet-place-html-labels .fleet-ocean-label {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
 }
 
 .fleet-continent-label {
-  display: inline-block;
-  transform: translate(-50%, -50%);
-  white-space: nowrap;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -664,8 +700,6 @@ html:not([data-theme="light"]) #fleet-map-canvas .leaflet-pane.fleetLabels {
     0 0 6px rgba(0, 0, 0, 0.9),
     0 1px 2px rgba(0, 0, 0, 0.95),
     0 0 1px rgba(0, 0, 0, 1);
-  pointer-events: none;
-  user-select: none;
   opacity: 0.95;
 }
 
@@ -674,6 +708,32 @@ html[data-theme="light"] .fleet-continent-label {
   text-shadow:
     0 0 4px rgba(255, 255, 255, 0.95),
     0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.fleet-ocean-label {
+  font-size: 10px;
+  font-weight: 650;
+  font-style: italic;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #e8f3fc;
+  text-shadow:
+    0 0 8px rgba(4, 20, 40, 0.95),
+    0 1px 3px rgba(0, 0, 0, 0.9),
+    0 0 1px rgba(0, 0, 0, 1);
+  opacity: 0.95;
+}
+
+html[data-theme="light"] .fleet-ocean-label {
+  color: #024066;
+  font-size: 11px;
+  font-weight: 700;
+  opacity: 1;
+  text-shadow:
+    0 0 10px rgba(255, 255, 255, 1),
+    0 0 4px rgba(255, 255, 255, 1),
+    0 1px 0 rgba(255, 255, 255, 1),
+    1px 1px 0 rgba(255, 255, 255, 0.9);
 }
 
 /* Leaflet clips overflow on marker icons — keep ping inside a 36×36 box. */

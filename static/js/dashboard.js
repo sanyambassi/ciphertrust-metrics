@@ -22,7 +22,7 @@ import {
   renderApplianceList,
   openModal,
   renderFleetHealth,
-} from "./appliances.js";
+} from "./appliances.js?v=20260722ver110";
 
 function chartXBounds() {
   const secs = RANGE_OPTIONS.find((r) => r.id === state.rangeId)?.seconds || 86400;

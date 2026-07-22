@@ -431,10 +431,13 @@ function destroyFleetMap() {
   if (state.fleetMap) {
     try { state.fleetMap.remove(); } catch (_) { /* ignore */ }
   }
+  const overlay = document.querySelector(".fleet-place-html-labels");
+  if (overlay) overlay.remove();
   state.fleetMap = null;
   state.fleetMapTileLayer = null;
   state.fleetMapLabelLayer = null;
   state.fleetMapContinents = null;
+  state.fleetMapOceans = null;
   state.fleetMapMarkers = null;
   state.fleetMapLinks = null;
   state.fleetMapSig = null;
@@ -442,7 +445,7 @@ function destroyFleetMap() {
   state.fleetMapTheme = null;
 }
 
-/** Dark-mode only at world zoom — light Carto tiles already print continent names. */
+/** Dark-mode world zoom only — light Voyager already prints continent names. */
 const CONTINENT_LABELS = [
   { name: "North America", lat: 48, lng: -100 },
   { name: "South America", lat: -14, lng: -58 },
@@ -450,55 +453,113 @@ const CONTINENT_LABELS = [
   { name: "Africa", lat: 8, lng: 20 },
   { name: "Asia", lat: 45, lng: 90 },
   { name: "Oceania", lat: -25, lng: 134 },
+  { name: "Antarctica", lat: -78, lng: 20 },
 ];
-const CONTINENT_LABEL_MAX_ZOOM = 3.5;
+/** Anchored in open water for typical fleet framing (US ↔ India at zoom 2–5). */
+const OCEAN_LABELS = [
+  { name: "Pacific Ocean", lat: 10, lng: -135 },
+  { name: "Atlantic Ocean", lat: 25, lng: -40 },
+  { name: "Indian Ocean", lat: -5, lng: 72 },
+  { name: "Arctic Ocean", lat: 72, lng: -5 },
+  { name: "Southern Ocean", lat: -52, lng: 10 },
+];
+/** Continent overlays only at true world zoom (both themes use our English names). */
+const MAP_CONTINENT_LABEL_MAX_ZOOM = 3.5;
 
-function syncContinentLabels() {
+/**
+ * HTML overlays (not Leaflet markers). DivIcon markers at edge longitudes were in
+ * the DOM but not composited into pixels on some GPUs — Atlantic painted, Pacific/Indian did not.
+ */
+function ensurePlaceHtmlOverlay(map) {
+  // Inside the Leaflet container so z-index sits above tiles but below markers.
+  const container = map.getContainer();
+  if (!container) return null;
+  let el = container.querySelector(".fleet-place-html-labels");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "fleet-place-html-labels";
+    el.setAttribute("aria-hidden", "true");
+    container.appendChild(el);
+  }
+  state.fleetMapOceans = el;
+  return el;
+}
+
+function redrawPlaceHtmlLabels() {
   const map = state.fleetMap;
-  const group = state.fleetMapContinents;
-  if (!map || !group) return;
+  const el = state.fleetMapOceans;
+  if (!map || !el || !el.classList?.contains("fleet-place-html-labels")) return;
+
+  const zoom = map.getZoom();
+  const continentView = zoom <= MAP_CONTINENT_LABEL_MAX_ZOOM;
+  const size = map.getSize();
+
+  const parts = [];
+  for (const item of OCEAN_LABELS) {
+    const pt = map.latLngToContainerPoint([item.lat, item.lng]);
+    if (pt.x < -80 || pt.y < -24 || pt.x > size.x + 80 || pt.y > size.y + 24) continue;
+    parts.push(
+      `<span class="fleet-ocean-label" style="left:${pt.x}px;top:${pt.y}px">${item.name}</span>`
+    );
+  }
+  if (continentView) {
+    for (const item of CONTINENT_LABELS) {
+      const pt = map.latLngToContainerPoint([item.lat, item.lng]);
+      if (pt.x < -80 || pt.y < -24 || pt.x > size.x + 80 || pt.y > size.y + 24) continue;
+      parts.push(
+        `<span class="fleet-continent-label" style="left:${pt.x}px;top:${pt.y}px">${item.name}</span>`
+      );
+    }
+  }
+  el.innerHTML = parts.join("");
+}
+
+/**
+ * Oceans: always on (both themes). Continents: world zoom, English overlays.
+ * Zoomed-in dark: Esri reference place labels. Light uses unlabeled Voyager.
+ */
+function syncFleetPlaceLabels() {
+  const map = state.fleetMap;
+  if (!map) return;
+  const zoom = map.getZoom();
+  const continentView = zoom <= MAP_CONTINENT_LABEL_MAX_ZOOM;
+  const dark = currentTheme() !== "light";
+
+  redrawPlaceHtmlLabels();
+
+  const labels = state.fleetMapLabelLayer;
+  if (!labels) return;
   try {
-    // Light basemap already has continent labels; ours would duplicate them.
-    const show =
-      currentTheme() !== "light" && map.getZoom() <= CONTINENT_LABEL_MAX_ZOOM;
-    if (show) {
-      if (!map.hasLayer(group)) group.addTo(map);
-    } else if (map.hasLayer(group)) {
-      map.removeLayer(group);
+    const showTileLabels = dark && !continentView;
+    if (showTileLabels) {
+      if (!map.hasLayer(labels)) labels.addTo(map);
+    } else if (map.hasLayer(labels)) {
+      map.removeLayer(labels);
     }
   } catch (_) { /* ignore */ }
 }
 
 function ensureContinentLabels(map) {
   if (!map) return;
-  if (!state.fleetMapContinents) {
-    if (!map.getPane("fleetContinents")) {
-      map.createPane("fleetContinents");
-      const pane = map.getPane("fleetContinents");
-      pane.style.zIndex = "450";
-      pane.style.pointerEvents = "none";
-    }
+  ensurePlaceHtmlOverlay(map);
 
-    const group = L.layerGroup();
-    for (const c of CONTINENT_LABELS) {
-      const icon = L.divIcon({
-        className: "fleet-continent-label-icon",
-        html: `<span class="fleet-continent-label">${c.name}</span>`,
-        iconSize: [0, 0],
-        iconAnchor: [0, 0],
-      });
-      L.marker([c.lat, c.lng], {
-        icon,
-        pane: "fleetContinents",
-        interactive: false,
-        keyboard: false,
-      }).addTo(group);
+  // Drop legacy Leaflet name markers if a prior session created them.
+  for (const key of ["fleetMapContinents"]) {
+    const group = state[key];
+    if (group && typeof group.clearLayers === "function") {
+      try { map.removeLayer(group); } catch (_) { /* ignore */ }
+      state[key] = null;
     }
-    state.fleetMapContinents = group;
-    map.on("zoomend", syncContinentLabels);
-    map.on("viewreset", syncContinentLabels);
   }
-  syncContinentLabels();
+
+  if (!map._fleetNameLabelsBound) {
+    map.on("zoomend", syncFleetPlaceLabels);
+    map.on("move", syncFleetPlaceLabels);
+    map.on("moveend", syncFleetPlaceLabels);
+    map.on("viewreset", syncFleetPlaceLabels);
+    map._fleetNameLabelsBound = true;
+  }
+  syncFleetPlaceLabels();
 }
 
 function fleetMapSignature() {
@@ -519,13 +580,17 @@ function fleetMapSignature() {
   return JSON.stringify({ theme: currentTheme(), markers: rows });
 }
 
-/** Basemap + optional label overlay. Dark Carto labels are too dim; Esri ref is readable. */
+/**
+ * Light: Carto Voyager without labels (blue oceans; multilingual OSM names removed).
+ * Dark: Esri Dark Gray — the look we had before the blue-water experiment.
+ */
 function mapBasemapSpec() {
   if (currentTheme() === "light") {
     return {
-      base: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+      base: "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}{r}.png",
       labels: null,
       subdomains: "abcd",
+      oceanTone: "light",
       attribution:
         '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
     };
@@ -535,6 +600,7 @@ function mapBasemapSpec() {
     labels:
       "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",
     subdomains: null,
+    oceanTone: "dark",
     attribution: 'Tiles &copy; <a href="https://www.esri.com/">Esri</a>',
   };
 }
@@ -564,6 +630,12 @@ function applyFleetMapTiles(map) {
   tiles.addTo(map);
   state.fleetMapTileLayer = tiles;
 
+  const { fleetMapCanvas } = getDom();
+  if (fleetMapCanvas) {
+    fleetMapCanvas.classList.toggle("is-ocean-light", spec.oceanTone === "light");
+    fleetMapCanvas.classList.toggle("is-ocean-dark", spec.oceanTone === "dark");
+  }
+
   if (spec.labels) {
     if (!map.getPane("fleetLabels")) {
       map.createPane("fleetLabels");
@@ -571,15 +643,17 @@ function applyFleetMapTiles(map) {
       pane.style.zIndex = "350";
       pane.style.pointerEvents = "none";
     }
-    const labels = L.tileLayer(spec.labels, {
+    const labelOpts = {
       maxZoom: 8,
       minZoom: 1,
       pane: "fleetLabels",
       opacity: 1,
-    });
-    labels.addTo(map);
-    state.fleetMapLabelLayer = labels;
+    };
+    if (spec.subdomains) labelOpts.subdomains = spec.subdomains;
+    // Don't add yet — syncFleetPlaceLabels shows these only when zoomed in.
+    state.fleetMapLabelLayer = L.tileLayer(spec.labels, labelOpts);
   }
+  syncFleetPlaceLabels();
 }
 
 function applianceMapTone(a) {
@@ -598,6 +672,13 @@ function ensureFleetMap() {
     worldCopyJump: true,
     zoomControl: true,
     attributionControl: true,
+    // Keep a sensible floor so the world still fills most of the canvas.
+    minZoom: 2,
+    // Latitude clamp only (stop polar void). Longitude span is huge so
+    // left/right pan stays free at world zoom — tight lng bounds (~±220)
+    // used to lock horizontal drag until the user zoomed in.
+    maxBounds: [[-85, -720], [85, 720]],
+    maxBoundsViscosity: 1,
   }).setView([20, 0], 2);
 
   applyFleetMapTiles(map);
@@ -623,7 +704,7 @@ function syncFleetMapTiles({ force = false } = {}) {
   if (!state.fleetMap) return;
   const theme = currentTheme();
   if (!force && state.fleetMapTheme === theme && state.fleetMapTileLayer) {
-    syncContinentLabels();
+    syncFleetPlaceLabels();
     return;
   }
   applyFleetMapTiles(state.fleetMap);
@@ -785,15 +866,18 @@ function paintFleetMap({ forceFit = false } = {}) {
   setTimeout(() => {
     try {
       map.invalidateSize({ animate: false });
-      if (!shouldFit) return;
-      if (bounds.length === 1) {
-        map.setView(bounds[0], 4, { animate: false });
-      } else if (bounds.length > 1) {
-        map.fitBounds(bounds, { padding: [36, 36], maxZoom: 5, animate: false });
-      } else {
-        map.setView([20, 0], 2, { animate: false });
+      if (shouldFit) {
+        if (bounds.length === 1) {
+          map.setView(bounds[0], 4, { animate: false });
+        } else if (bounds.length > 1) {
+          map.fitBounds(bounds, { padding: [36, 36], maxZoom: 5, animate: false });
+        } else {
+          map.setView([20, 0], 2, { animate: false });
+        }
+        state.fleetMapFitted = true;
       }
-      state.fleetMapFitted = true;
+      // Fit can change zoom; re-sync ocean/continent overlays after settle.
+      syncFleetPlaceLabels();
     } catch (_) { /* ignore */ }
   }, 40);
 }

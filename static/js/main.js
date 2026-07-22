@@ -22,7 +22,7 @@ import {
   handleApplianceAction,
   renderFleetHealth,
   pollDeleteNotifications,
-} from "./appliances.js";
+} from "./appliances.js?v=20260722ver110";
 import {
   showHealthcheckTab,
   stopHealthcheckPoll,
@@ -40,7 +40,7 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js?v=20260720popup1";
+} from "./dashboard.js?v=20260722ver110";
 
 const dom = getDom();
 const {
