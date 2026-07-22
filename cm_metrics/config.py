@@ -50,6 +50,8 @@ class Config:
     # TLS verification is always disabled per product requirement for CM connections.
     CM_VERIFY_TLS: bool = False
     SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL", "60"))
+    # How often to re-probe appliances marked offline (background loop otherwise skips them).
+    OFFLINE_RETRY_INTERVAL: int = int(os.getenv("OFFLINE_RETRY_INTERVAL", "3600"))
     # REST ops snapshot (users/backups/scheduler) — slower than Prometheus scrapes.
     OPS_SNAPSHOT_INTERVAL: int = int(os.getenv("OPS_SNAPSHOT_INTERVAL", "120"))
     # Keep enough in-memory history for the UI time-range picker (up to 30d).

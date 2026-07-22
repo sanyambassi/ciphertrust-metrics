@@ -864,7 +864,8 @@ class MetricsScraper:
         if not appliance.get("enabled"):
             return {"ok": False, "error": "disabled"}
 
-        # After enough consecutive failures, skip auto-scrapes until the user refreshes.
+        # After enough consecutive failures, skip frequent auto-scrapes.
+        # Hourly offline re-probes use force=True from scrape_all.
         if not force and db.is_appliance_offline(appliance):
             db.ensure_offline_status(appliance_id)
             return {
@@ -1109,18 +1110,22 @@ class MetricsScraper:
     def scrape_all(self, *, force: bool = False) -> list[dict[str, Any]]:
         """Scrape every enabled appliance.
 
-        Background loop uses force=False and skips known-offline hosts.
-        Manual Refresh uses force=True so offline appliances are retried in parallel.
+        Background loop (force=False) keeps healthy hosts fresh, skips pending/
+        deleting, and re-probes offline hosts about once per
+        ``OFFLINE_RETRY_INTERVAL`` (default 1h). Manual Refresh uses force=True.
         """
         enabled = [a for a in db.list_appliances() if a.get("enabled")]
         results: list[dict[str, Any]] = []
+        now = time.time()
+        offline_retry = max(60, int(Config.OFFLINE_RETRY_INTERVAL))
 
         if not force:
             for appliance in enabled:
                 status = (appliance.get("last_status") or "").lower()
-                # Background loop only keeps healthy hosts fresh. Offline/error/
-                # pending are retried on manual Refresh (force=True) so a sick
-                # peer cannot hold scrape locks / DB writers for minutes.
+                aid = int(appliance["id"])
+                # Background loop only keeps healthy hosts fresh. Offline hosts
+                # get a slow hourly re-probe; error/pending wait for Refresh so
+                # a sick peer cannot hold scrape locks / DB writers for minutes.
                 if status in {
                     "offline",
                     "error",
@@ -1128,6 +1133,19 @@ class MetricsScraper:
                     "deleting",
                     "delete_failed",
                 } or db.is_appliance_offline(appliance):
+                    # Never auto-retry mid-delete or in-flight pending connects.
+                    if status in {"deleting", "delete_failed", "pending"}:
+                        results.append(
+                            {
+                                "ok": False,
+                                "skipped": True,
+                                "error": status,
+                                "appliance_id": aid,
+                                "fail_count": int(appliance.get("fail_count") or 0),
+                            }
+                        )
+                        continue
+
                     # Stuck "error" from a timeout never reaches offline because
                     # background skips retries — promote clear connectivity failures.
                     if status == "error" and _is_connectivity_error(
@@ -1135,7 +1153,7 @@ class MetricsScraper:
                     ):
                         try:
                             db.update_appliance_scrape(
-                                int(appliance["id"]),
+                                aid,
                                 ok=False,
                                 sample_count=0,
                                 error=str(appliance.get("last_error") or "unreachable"),
@@ -1146,18 +1164,38 @@ class MetricsScraper:
                             pass
                         status = "offline"
                     elif status != "offline" and db.is_appliance_offline(appliance):
-                        db.ensure_offline_status(int(appliance["id"]))
+                        db.ensure_offline_status(aid)
+                        status = "offline"
+
+                    # Offline (or fail_count past threshold): re-probe about once an hour.
+                    if status == "offline" or db.is_appliance_offline(appliance):
+                        last = float(
+                            appliance.get("last_scrape_at")
+                            or appliance.get("updated_at")
+                            or 0
+                        )
+                        age = now - last if last > 0 else offline_retry
+                        if age >= offline_retry:
+                            logger.info(
+                                "Hourly offline re-probe for appliance %s (last contact %.0fs ago)",
+                                aid,
+                                age,
+                            )
+                            results.append(self.scrape_appliance(aid, force=True))
+                            time.sleep(0.5)
+                            continue
+
                     results.append(
                         {
                             "ok": False,
                             "skipped": True,
                             "error": status or "offline",
-                            "appliance_id": int(appliance["id"]),
+                            "appliance_id": aid,
                             "fail_count": int(appliance.get("fail_count") or 0),
                         }
                     )
                     continue
-                results.append(self.scrape_appliance(int(appliance["id"]), force=False))
+                results.append(self.scrape_appliance(aid, force=False))
                 # Small stagger between appliances to avoid thundering-herd on CM/SQLite.
                 time.sleep(0.5)
         else:
