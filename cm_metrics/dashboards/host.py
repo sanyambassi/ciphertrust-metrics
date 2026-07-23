@@ -13,8 +13,26 @@ from .panels import (
     _bytes_to_gb,
     _named_series,
     _fmt_duration_seconds,
-    _container_cpu_pct
+    _container_cpu_pct,
 )
+
+def _host_memory_series(store: ApplianceStore) -> list[dict[str, Any]]:
+    """Labeled memory pool timeseries for the Host board."""
+    out: list[dict[str, Any]] = []
+    for label, metric in (
+        ("Total", "node_memory_MemTotal_bytes"),
+        ("Available", "node_memory_MemAvailable_bytes"),
+        ("Free", "node_memory_MemFree_bytes"),
+        ("Buffers", "node_memory_Buffers_bytes"),
+        ("Cached", "node_memory_Cached_bytes"),
+        ("SReclaimable", "node_memory_SReclaimable_bytes"),
+    ):
+        for series in _named_series(store, metric, limit=1):
+            pts = series.get("points") or []
+            if pts:
+                out.append({"name": label, "points": pts})
+    return out
+
 
 def build_host(store: ApplianceStore) -> list[dict[str, Any]]:
     now = store.gauge_value("node_time_seconds")
@@ -39,6 +57,13 @@ def build_host(store: ApplianceStore) -> list[dict[str, Any]]:
         _stat("Net IN (approx rate)", store.rate("node_network_receive_bytes_total"), "B/s"),
         _stat("Net OUT (approx rate)", store.rate("node_network_transmit_bytes_total"), "B/s"),
         _timeseries(
+            "Memory Breakdown",
+            _host_memory_series(store),
+            "bytes",
+            "Host memory pools (node_memory_*_bytes).",
+            wide=True,
+        ),
+        _timeseries(
             "Network Receive Bytes",
             _named_series(store, "node_network_receive_bytes_total", rate=True, label_keys=["device"]),
             "B/s",
@@ -49,6 +74,26 @@ def build_host(store: ApplianceStore) -> list[dict[str, Any]]:
             "B/s",
         ),
         _timeseries(
+            "Network Receive Errors",
+            _named_series(store, "node_network_receive_errs_total", rate=True, label_keys=["device"]),
+            "err/s",
+        ),
+        _timeseries(
+            "Network Transmit Errors",
+            _named_series(store, "node_network_transmit_errs_total", rate=True, label_keys=["device"]),
+            "err/s",
+        ),
+        _timeseries(
+            "Network Receive Drops",
+            _named_series(store, "node_network_receive_drop_total", rate=True, label_keys=["device"]),
+            "drop/s",
+        ),
+        _timeseries(
+            "Network Transmit Drops",
+            _named_series(store, "node_network_transmit_drop_total", rate=True, label_keys=["device"]),
+            "drop/s",
+        ),
+        _timeseries(
             "Disk Read Bytes",
             _named_series(store, "node_disk_read_bytes_total", rate=True, label_keys=["device"]),
             "B/s",
@@ -57,6 +102,18 @@ def build_host(store: ApplianceStore) -> list[dict[str, Any]]:
             "Disk Write Bytes",
             _named_series(store, "node_disk_written_bytes_total", rate=True, label_keys=["device"]),
             "B/s",
+        ),
+        _timeseries(
+            "Disk Read Time",
+            _named_series(store, "node_disk_read_time_seconds_total", rate=True, label_keys=["device"]),
+            "s/s",
+            "Rate of time spent reading (node_disk_read_time_seconds_total).",
+        ),
+        _timeseries(
+            "Disk Write Time",
+            _named_series(store, "node_disk_write_time_seconds_total", rate=True, label_keys=["device"]),
+            "s/s",
+            "Rate of time spent writing (node_disk_write_time_seconds_total).",
         ),
         _timeseries(
             "CPU Seconds by Mode (rate)",

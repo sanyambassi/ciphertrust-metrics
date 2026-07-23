@@ -214,7 +214,7 @@ DASHBOARDS: list[dict[str, Any]] = [
         "id": "cluster",
         "title": "Cluster / Node",
         "icon": "git-branch",
-        "description": "Appliance-wide raft status, node count, replication lags, and connectivity.",
+        "description": "Raft status, replication lags, and peer connectivity.",
         "min_version": "2.10.0",
         "group": "network",
         "builder": build_cluster,
@@ -400,6 +400,7 @@ def get_dashboard(
     *,
     range_seconds: float | None = None,
     range_id: str | None = None,
+    member_stores: list[tuple[dict[str, Any], ApplianceStore]] | None = None,
 ) -> dict[str, Any] | None:
     token = set_dashboard_range(range_seconds)
     try:
@@ -407,10 +408,13 @@ def get_dashboard(
             if d["id"] == dashboard_id:
                 builder = d["builder"]
                 # Dashboards that mix Prometheus + REST ops snapshot need appliance context.
-                if dashboard_id in {
+                if dashboard_id == "cluster":
+                    panels = _layout_panels(
+                        builder(store, appliance, member_stores=member_stores)
+                    )
+                elif dashboard_id in {
                     "overview",
                     "resources-keys",
-                    "cluster",
                     "backups",
                     "scheduler",
                     "quorum",
@@ -421,7 +425,7 @@ def get_dashboard(
                     panels = _layout_panels(builder(store, appliance))
                 else:
                     panels = _layout_panels(builder(store))
-                return {
+                out: dict[str, Any] = {
                     "id": d["id"],
                     "title": d["title"],
                     "description": d["description"],
@@ -430,6 +434,18 @@ def get_dashboard(
                     "range_seconds": range_seconds,
                     "panels": panels,
                 }
+                if dashboard_id == "cluster" and member_stores:
+                    out["fleet_cluster"] = len(member_stores) > 1
+                    out["cluster_members"] = [
+                        {
+                            "id": m.get("id"),
+                            "display_name": m.get("display_name"),
+                            "last_status": m.get("last_status"),
+                            "host": m.get("host"),
+                        }
+                        for m, _ in member_stores
+                    ]
+                return out
     finally:
         reset_dashboard_range(token)
     return None

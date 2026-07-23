@@ -75,9 +75,34 @@ export function fmtDurationSeconds(seconds) {
   return `${sign}${(abs * 1e9).toFixed(0)} ns`;
 }
 
+export function fmtUnixTime(value, { short = false } = {}) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  // CipherTrust connect_time is unix seconds; tolerate ms if ever sent.
+  const ms = n > 1e12 ? n : n * 1000;
+  const d = new Date(ms);
+  if (short) {
+    return d.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  return d.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 export function fmt(value, unit) {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   if (typeof value === "string") return value;
+  if (unit === "unix" || unit === "datetime") return fmtUnixTime(value);
   if (unit === "duration" || unit === "uptime") return fmtDuration(value);
   // Large plain-second gauges (e.g. uptime mistakenly labeled "s")
   if (unit === "s" && Number(value) >= 3600) return fmtDuration(value);
@@ -97,6 +122,7 @@ export function fmt(value, unit) {
 
 export function displayUnit(unit, value) {
   if (!unit || unit === "duration" || unit === "uptime") return "";
+  if (unit === "unix" || unit === "datetime") return "";
   if (unit === "s" && Number(value) >= 3600) return "";
   // latency helper already includes ms/µs/s
   if (unit === "s" && Number.isFinite(Number(value)) && Math.abs(Number(value)) < 1) return "";
@@ -108,6 +134,7 @@ export function displayUnit(unit, value) {
 export function yTickCallback(unit) {
   if (isBytesUnit(unit)) return (v) => fmtBytes(v, false);
   if (isBytesRateUnit(unit)) return (v) => fmtBytes(v, true);
+  if (unit === "unix" || unit === "datetime") return (v) => fmtUnixTime(v, { short: true });
   return undefined;
 }
 
@@ -117,8 +144,8 @@ export function truncateLabel(text, max = 36) {
 }
 
 export function formatSeriesTooltip(unit, ctx) {
-  let name = ctx.dataset.label || "";
-  if (name.length > 40) name = `${name.slice(0, 37)}…`;
+  // Prefer full series name (tooltips must not inherit legend truncation).
+  const name = ctx.dataset.fullLabel || ctx.dataset.label || "";
   const raw = ctx.parsed?.y;
   if (raw == null || Number.isNaN(raw)) return name;
   if (isBytesUnit(unit)) return `${name}: ${fmtBytes(raw, false)}`;

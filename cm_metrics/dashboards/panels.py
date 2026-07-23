@@ -378,6 +378,35 @@ def _bytes_to_gb(value: float | None) -> float | None:
 
 
 
+def _hold_filled_sum(
+    series_points: list[dict[float, float]],
+) -> list[dict[str, float]]:
+    """Sum gauge series across a shared timeline with step hold-fill.
+
+    Long ranges (>2h) downsample individual metric rows, so many timestamps only
+    include a subset of fingerprints. A naive sum then under-counts (6h+ Total
+    Keys sawtooth). Holding each series' last/first known value across the
+    timeline keeps the total stable between real scrapes.
+    """
+    if not series_points:
+        return []
+    timeline = sorted({t for pts in series_points for t in pts})
+    if not timeline:
+        return []
+    buckets: dict[float, float] = {t: 0.0 for t in timeline}
+    for pts in series_points:
+        ordered = sorted(pts.items())
+        first_v = ordered[0][1]
+        last_v = first_v
+        idx = 0
+        for t in timeline:
+            while idx < len(ordered) and ordered[idx][0] <= t:
+                last_v = ordered[idx][1]
+                idx += 1
+            buckets[t] += first_v if idx == 0 else last_v
+    return [{"t": float(t), "v": buckets[t]} for t in timeline]
+
+
 def _summed_series(
     store: ApplianceStore,
     name: str,
@@ -389,25 +418,25 @@ def _summed_series(
     """Sum all matching labeled series into one timeseries (e.g. total keys over time).
 
     Per labeled series, keep only the last sample in each second so overlapping
-    scrapes (Auto refresh + background loop) do not double-count.
+    scrapes (Auto refresh + background loop) do not double-count. Values are
+    hold-filled across the timeline so long-range downsampling cannot under-count.
     """
     raw = store.series_by_name(
         name, labels, since=_series_since(), limit_series=limit_series
     )
     if not raw:
         return []
-    buckets: dict[float, float] = {}
+    series_points: list[dict[float, float]] = []
     for item in raw:
-        # Collapse duplicate timestamps within this series first (last wins).
         per_series: dict[float, float] = {}
         for pt in item.get("points") or []:
             key = round(float(pt["t"]))
             per_series[key] = float(pt["v"])
-        for key, value in per_series.items():
-            buckets[key] = buckets.get(key, 0.0) + value
-    if not buckets:
+        if per_series:
+            series_points.append(per_series)
+    points = _hold_filled_sum(series_points)
+    if not points:
         return []
-    points = [{"t": float(t), "v": v} for t, v in sorted(buckets.items())]
     return [{"name": series_name, "points": points}]
 
 
@@ -422,16 +451,16 @@ def _summed_by_label_series(
 ) -> list[dict[str, Any]]:
     """Sum matching series into one timeseries per distinct label value.
 
-    Same per-second dedupe as ``_summed_series`` so Auto refresh + background
-    scrapes do not double-count within a labeled group (e.g. algorithm).
+    Same per-second dedupe / hold-fill as ``_summed_series`` so Auto refresh +
+    background scrapes and long-range downsampling do not distort group totals.
     """
     raw = store.series_by_name(
         name, labels, since=_series_since(), limit_series=limit_series
     )
     if not raw:
         return []
-    # group_key -> {second -> value}
-    groups: dict[str, dict[float, float]] = {}
+    # group_key -> list of per-series point maps
+    groups: dict[str, list[dict[float, float]]] = {}
     for item in raw:
         labels_map = item.get("labels") or {}
         key = str(labels_map.get(group_label) or "unknown")
@@ -439,21 +468,24 @@ def _summed_by_label_series(
         for pt in item.get("points") or []:
             t = round(float(pt["t"]))
             per_series[t] = float(pt["v"])
-        bucket = groups.setdefault(key, {})
-        for t, value in per_series.items():
-            bucket[t] = bucket.get(t, 0.0) + value
+        if per_series:
+            groups.setdefault(key, []).append(per_series)
     if not groups:
         return []
+    built: list[tuple[str, list[dict[str, float]]]] = []
+    for legend, series_points in groups.items():
+        points = _hold_filled_sum(series_points)
+        if points:
+            built.append((legend, points))
     # Prefer groups with the highest latest value so charts stay readable.
     ranked = sorted(
-        groups.items(),
-        key=lambda kv: max(kv[1].values()) if kv[1] else 0.0,
+        built,
+        key=lambda kv: kv[1][-1]["v"] if kv[1] else 0.0,
         reverse=True,
     )[:max_groups]
-    out: list[dict[str, Any]] = []
-    for legend, buckets in ranked:
-        points = [{"t": float(t), "v": v} for t, v in sorted(buckets.items())]
-        out.append({"name": legend, "points": points})
+    out: list[dict[str, Any]] = [
+        {"name": legend, "points": points} for legend, points in ranked
+    ]
     # Stable alphabetical legend order for the UI (after ranking/truncation).
     out.sort(key=lambda s: str(s["name"]).lower())
     return out
@@ -482,11 +514,27 @@ def _named_series(
         "access_id",
         "cluster_name",
     }
+    # Resolve account_uri / account before truncating — a 48-char cut chops the
+    # domain UUID and leaves raw kylo:… legends that _rename_account_series cannot fix.
+    id_to_name: dict[str, str] | None = None
+    account_label_keys = {"account_uri", "account"}
+    if label_keys and any(k in account_label_keys for k in label_keys):
+        id_to_name = _domain_name_map(store)
+
     out: list[dict[str, Any]] = []
     for item in raw:
         labels_map = item["labels"]
         if label_keys:
-            legend = " / ".join(str(labels_map.get(k, "")) for k in label_keys if labels_map.get(k))
+            parts: list[str] = []
+            for k in label_keys:
+                raw_val = labels_map.get(k)
+                if not raw_val:
+                    continue
+                if k in account_label_keys:
+                    parts.append(_friendly_account_label(str(raw_val), id_to_name))
+                else:
+                    parts.append(str(raw_val))
+            legend = " / ".join(parts)
         else:
             preferred = [
                 k
@@ -521,19 +569,163 @@ def _named_series(
         # Keep legends short for UI tooltips
         if len(legend) > 48:
             legend = legend[:45] + "…"
-        points = item["points"]
-        if rate and len(points) >= 2:
+        raw_points = item["points"]
+        points = raw_points
+        if rate and len(raw_points) >= 2:
             rate_points = []
-            for i in range(1, len(points)):
-                dt = points[i]["t"] - points[i - 1]["t"]
+            for i in range(1, len(raw_points)):
+                dt = raw_points[i]["t"] - raw_points[i - 1]["t"]
                 if dt <= 0:
                     continue
                 rate_points.append(
-                    {"t": points[i]["t"], "v": (points[i]["v"] - points[i - 1]["v"]) / dt}
+                    {
+                        "t": raw_points[i]["t"],
+                        "v": (raw_points[i]["v"] - raw_points[i - 1]["v"]) / dt,
+                    }
                 )
+            # Short ranges (e.g. 5m) often have only 2 scrapes → 1 rate sample.
+            # Chart.js line charts need ≥2 points to draw, so stretch across the
+            # scrape interval that produced the rate.
+            if len(rate_points) == 1:
+                rate_points = [
+                    {"t": raw_points[-2]["t"], "v": rate_points[0]["v"]},
+                    rate_points[0],
+                ]
             points = rate_points
         out.append({"name": legend, "points": points})
     return out
+
+
+def _avg_series(
+    store: ApplianceStore,
+    sum_name: str,
+    count_name: str | None = None,
+    labels: dict[str, str] | None = None,
+    *,
+    limit: int = 10,
+    label_keys: list[str] | None = None,
+    aggregate: bool = False,
+    series_name: str = "avg",
+) -> list[dict[str, Any]]:
+    """Average latency from histogram/summary counters: Δsum / Δcount per scrape.
+
+    Matches Grafana ``rate(*_sum[1m]) / rate(*_count[1m])``. When ``aggregate``
+    is True, all labeled series are combined into one line.
+    """
+    if not count_name:
+        if sum_name.endswith("_sum"):
+            count_name = sum_name[: -len("_sum")] + "_count"
+        else:
+            count_name = sum_name + "_count"
+
+    sum_raw = store.series_by_name(
+        sum_name, labels, since=_series_since(), limit_series=max(limit, 50)
+    )
+    count_raw = store.series_by_name(
+        count_name, labels, since=_series_since(), limit_series=max(limit, 50)
+    )
+    if not sum_raw or not count_raw:
+        return []
+
+    skip_label_keys = {
+        "otel_scope_name",
+        "otel_scope_schema_url",
+        "otel_scope_version",
+        "job",
+        "instance",
+        "service",
+        "component",
+        "account_id",
+        "access_id",
+        "cluster_name",
+    }
+
+    def _label_key(labs: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                (str(k), str(v))
+                for k, v in (labs or {}).items()
+                if k not in skip_label_keys and not str(k).startswith("otel_")
+            )
+        )
+
+    def _deltas(points: list[dict[str, Any]]) -> list[tuple[float, float, float]]:
+        """Return (t, delta_v, dt) for consecutive points."""
+        out: list[tuple[float, float, float]] = []
+        for i in range(1, len(points)):
+            dt = float(points[i]["t"]) - float(points[i - 1]["t"])
+            if dt <= 0:
+                continue
+            out.append((float(points[i]["t"]), float(points[i]["v"]) - float(points[i - 1]["v"]), dt))
+        return out
+
+    counts_by_key = {_label_key(item.get("labels") or {}): item for item in count_raw}
+
+    if aggregate:
+        # Align by timestamp across all series, then Δtotal_sum / Δtotal_count.
+        sum_by_t: dict[float, float] = defaultdict(float)
+        cnt_by_t: dict[float, float] = defaultdict(float)
+        for item in sum_raw:
+            for pt in item.get("points") or []:
+                sum_by_t[round(float(pt["t"]))] += float(pt["v"])
+        for item in count_raw:
+            for pt in item.get("points") or []:
+                cnt_by_t[round(float(pt["t"]))] += float(pt["v"])
+        timeline = sorted(set(sum_by_t) & set(cnt_by_t))
+        if len(timeline) < 2:
+            return []
+        avg_pts: list[dict[str, float]] = []
+        for i in range(1, len(timeline)):
+            t0, t1 = timeline[i - 1], timeline[i]
+            d_sum = sum_by_t[t1] - sum_by_t[t0]
+            d_cnt = cnt_by_t[t1] - cnt_by_t[t0]
+            if d_cnt <= 0:
+                continue
+            avg_pts.append({"t": float(t1), "v": d_sum / d_cnt})
+        if len(avg_pts) == 1 and len(timeline) >= 2:
+            avg_pts = [{"t": float(timeline[0]), "v": avg_pts[0]["v"]}, avg_pts[0]]
+        return [{"name": series_name, "points": avg_pts}] if avg_pts else []
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for s_item in sum_raw:
+        key = _label_key(s_item.get("labels") or {})
+        c_item = counts_by_key.get(key)
+        if not c_item:
+            continue
+        s_deltas = {t: (dv, dt) for t, dv, dt in _deltas(s_item.get("points") or [])}
+        c_deltas = {t: (dv, dt) for t, dv, dt in _deltas(c_item.get("points") or [])}
+        avg_pts = []
+        for t in sorted(set(s_deltas) & set(c_deltas)):
+            d_sum, _ = s_deltas[t]
+            d_cnt, _ = c_deltas[t]
+            if d_cnt <= 0:
+                continue
+            avg_pts.append({"t": t, "v": d_sum / d_cnt})
+        if not avg_pts:
+            continue
+        if len(avg_pts) == 1:
+            raw_s = s_item.get("points") or []
+            if len(raw_s) >= 2:
+                avg_pts = [{"t": float(raw_s[-2]["t"]), "v": avg_pts[0]["v"]}, avg_pts[0]]
+        labels_map = s_item.get("labels") or {}
+        keys = label_keys or (
+            "method",
+            "path",
+            "service",
+            "upstream_service",
+            "host",
+            "node",
+        )
+        legend = " / ".join(str(labels_map[k]) for k in keys if labels_map.get(k))
+        if not legend:
+            legend = series_name
+        if len(legend) > 48:
+            legend = legend[:45] + "…"
+        activity = sum(abs(p["v"]) for p in avg_pts)
+        scored.append((activity, {"name": legend, "points": avg_pts}))
+
+    scored.sort(key=lambda x: -x[0])
+    return [item for _, item in scored[:limit]]
 
 
 def _first_gauge(store: ApplianceStore, *names: str, labels: dict[str, str] | None = None) -> float | None:

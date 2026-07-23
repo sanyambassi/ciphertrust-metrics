@@ -432,12 +432,30 @@ def create_app() -> Flask:
             if snap:
                 appliance["ops_snapshot"] = snap
         range_id, range_seconds = parse_range(request.args.get("range"))
+
+        member_stores = None
+        if dashboard_id == "cluster":
+            members = db.list_cluster_members(appliance_id)
+            member_stores = []
+            for member in members:
+                mid = int(member["id"])
+                m = dict(member)
+                # Prefer primary's REST cluster summary for fleet tiles.
+                snap = db.get_appliance_ops_snapshot(mid)
+                if snap:
+                    m["ops_snapshot"] = snap
+                member_stores.append((m, store.for_appliance(mid)))
+            # Prefer primary appliance dict for top-level response context.
+            if member_stores:
+                appliance = member_stores[0][0]
+
         data = get_dashboard(
             dashboard_id,
             store.for_appliance(appliance_id),
             appliance,
             range_seconds=range_seconds,
             range_id=range_id,
+            member_stores=member_stores,
         )
         if not data:
             return jsonify({"error": "dashboard not found"}), 404

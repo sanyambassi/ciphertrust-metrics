@@ -355,9 +355,21 @@ class ApplianceStore:
                         "value": sample.value,
                     }
 
+            def _activity(item: dict[str, Any]) -> float:
+                """Prefer series that actually moved in-window (not idle 0-rate paths)."""
+                pts = item.get("points") or []
+                if not pts:
+                    return 0.0
+                if len(pts) == 1:
+                    return abs(float(pts[0]["v"]))
+                return abs(float(pts[-1]["v"]) - float(pts[0]["v"]))
+
             ranked = sorted(
                 by_fp.values(),
-                key=lambda item: item["points"][-1]["t"] if item.get("points") else 0.0,
+                key=lambda item: (
+                    _activity(item),
+                    item["points"][-1]["t"] if item.get("points") else 0.0,
+                ),
                 reverse=True,
             )[:limit_series]
             results: list[dict[str, Any]] = []

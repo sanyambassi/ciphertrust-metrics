@@ -12,6 +12,7 @@ from .panels import (
     _bar,
     _note,
     _named_series,
+    _avg_series,
     _first_gauge,
     _first_rate,
 )
@@ -134,11 +135,52 @@ def build_developer(store: ApplianceStore) -> list[dict[str, Any]]:
             "ops/s",
         ),
         _timeseries(
+            "Avg JWT Processing Time",
+            _avg_series(
+                store,
+                "ciphertrust_api_jwt_middleware_processing_time_seconds_sum",
+                "ciphertrust_api_jwt_middleware_processing_time_seconds_count",
+                aggregate=True,
+                series_name="JWT",
+            )
+            or _avg_series(
+                store,
+                "ciphertrust_jwt_processing_time_seconds_sum",
+                "ciphertrust_jwt_processing_time_seconds_count",
+                aggregate=True,
+                series_name="JWT",
+            ),
+            "s",
+            "Average JWT middleware processing latency over the selected range.",
+        ),
+        _timeseries(
             "Authorization Ops",
             _named_series(
                 store, "ciphertrust_authorization_authorization_seconds_count", rate=True
             ),
             "ops/s",
+        ),
+        _timeseries(
+            "Prometheus Scrape Latency",
+            _avg_series(
+                store,
+                "http_response_time_seconds_sum",
+                "http_response_time_seconds_count",
+                {"path": "/metrics/prometheus"},
+                aggregate=True,
+                series_name="scrape",
+            )
+            or _avg_series(
+                store,
+                "http_response_time_seconds_sum",
+                "http_response_time_seconds_count",
+                {"path": "/system/metrics/prometheus"},
+                aggregate=True,
+                series_name="scrape",
+            ),
+            "s",
+            "Average response time for the Prometheus metrics endpoint.",
+            wide=True,
         ),
         _bar(
             "SQL Open Connections by DB",

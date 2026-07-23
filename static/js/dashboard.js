@@ -13,7 +13,7 @@ import {
   isBytesUnit,
   isBytesRateUnit,
   fmtBytes,
-} from "./format.js";
+} from "./format.js?v=20260723voff1";
 import { chartColors, cssVar } from "./theme.js";
 import { fetchJSON, refreshStatus } from "./api.js";
 import {
@@ -286,6 +286,7 @@ function makeLineChart(canvas, panel) {
   // Chart.defaults...generateLabels — in Chart.js 4 that recurses forever.
   const datasets = (panel.series || []).map((s, i) => ({
     label: truncateLabel(s.name, 36),
+    fullLabel: String(s.name || ""),
     data: (s.points || []).map((p) => ({ x: p.t * 1000, y: p.v })),
     borderColor: COLORS[i % COLORS.length],
     backgroundColor: COLORS[i % COLORS.length] + "33",
@@ -293,6 +294,15 @@ function makeLineChart(canvas, panel) {
     pointRadius: 0,
     tension: 0.25,
   }));
+  const hideYTitle =
+    !unit ||
+    isBytesUnit(unit) ||
+    isBytesRateUnit(unit) ||
+    unit === "%" ||
+    unit === "unix" ||
+    unit === "datetime" ||
+    unit === "duration" ||
+    unit === "uptime";
   return new Chart(canvas, {
     type: "line",
     data: { datasets },
@@ -313,6 +323,16 @@ function makeLineChart(canvas, panel) {
             boxHeight: 10,
             padding: 12,
             font: { size: 10 },
+          },
+          onHover: (evt, legendItem, legend) => {
+            const ds = legend?.chart?.data?.datasets?.[legendItem.datasetIndex];
+            const tip = ds?.fullLabel || ds?.label || "";
+            const el = evt?.native?.target;
+            if (el && tip) el.title = tip;
+          },
+          onLeave: (evt) => {
+            const el = evt?.native?.target;
+            if (el) el.title = "";
           },
         },
         tooltip: {
@@ -345,9 +365,9 @@ function makeLineChart(canvas, panel) {
           grace: "5%",
           grid: { color: grid, drawBorder: false },
           border: { display: false },
-          title: unit && !isBytesUnit(unit) && !isBytesRateUnit(unit) && unit !== "%"
-            ? { display: true, text: unit, color: cssVar("--muted", "#8b9bb8"), font: { size: 10 } }
-            : undefined,
+          title: hideYTitle
+            ? undefined
+            : { display: true, text: unit, color: cssVar("--muted", "#8b9bb8"), font: { size: 10 } },
           ticks: {
             padding: 8,
             maxTicksLimit: 6,
@@ -784,13 +804,35 @@ export async function openCrdpForAppliance(applianceId) {
   await refreshStatus().catch(() => null);
 }
 
+function fleetTitle(data) {
+  const appliance = data.appliance;
+  const members = data.cluster_members || [];
+  const fleet = Boolean(data.fleet_cluster) && members.length > 1;
+  if (!fleet) {
+    const host = appliance ? (appliance.display_name || appliance.host) : "";
+    return data.title + (host ? ` · ${host.replace(/^https?:\/\//, "")}` : "");
+  }
+  const clusterName =
+    (appliance && (appliance.cluster_display_name || "").trim()) ||
+    (appliance && (appliance.display_name || "").trim()) ||
+    "Cluster";
+  const offline = members.filter(
+    (m) => String(m.last_status || "").toLowerCase() === "offline"
+  ).length;
+  const err = members.filter(
+    (m) => String(m.last_status || "").toLowerCase() === "error"
+  ).length;
+  let title = `${data.title} · ${clusterName} (${members.length} nodes)`;
+  if (offline) title += ` · ${offline} offline`;
+  if (err) title += ` · ${err} error`;
+  return title;
+}
+
 export function fullRender(data, animate = true) {
   const { panelsEl, titleEl, descEl } = getDom();
   destroyCharts();
   panelsEl.innerHTML = "";
-  const appliance = data.appliance;
-  const host = appliance ? (appliance.display_name || appliance.host) : "";
-  titleEl.textContent = data.title + (host ? ` · ${host.replace(/^https?:\/\//, "")}` : "");
+  titleEl.textContent = fleetTitle(data);
   descEl.textContent = data.description || "";
 
   const panels = data.panels || [];
@@ -834,9 +876,7 @@ export function fullRender(data, animate = true) {
 export function updateInPlace(data) {
   const { panelsEl, titleEl } = getDom();
   if (!panelsEl) return false;
-  const appliance = data.appliance;
-  const host = appliance ? (appliance.display_name || appliance.host) : "";
-  titleEl.textContent = data.title + (host ? ` · ${host.replace(/^https?:\/\//, "")}` : "");
+  titleEl.textContent = fleetTitle(data);
 
   const panels = data.panels || [];
   for (const panel of panels) {
@@ -879,6 +919,7 @@ export function updateInPlace(data) {
       const xBounds = chartXBounds();
       chart.data.datasets = series.map((s, i) => ({
         label: truncateLabel(s.name, 36),
+        fullLabel: String(s.name || ""),
         data: (s.points || []).map((p) => ({ x: p.t * 1000, y: p.v })),
         borderColor: COLORS[i % COLORS.length],
         backgroundColor: COLORS[i % COLORS.length] + "33",

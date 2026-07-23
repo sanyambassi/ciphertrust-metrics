@@ -10,7 +10,9 @@ from .panels import (
     _timeseries,
     _bar,
     _named_series,
-    _op_status_items
+    _avg_series,
+    _op_status_items,
+    _note,
 )
 
 def build_nae(store: ApplianceStore) -> list[dict[str, Any]]:
@@ -58,6 +60,30 @@ def build_nae(store: ApplianceStore) -> list[dict[str, Any]]:
             "ops/s",
         ),
         _timeseries(
+            "Avg NAE XML Response Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_response_time_seconds_sum",
+                "ciphertrust_nae_xml_response_time_seconds_count",
+                aggregate=True,
+                series_name="XML response",
+            ),
+            "s",
+            "Average NAE-XML response latency (sum/count).",
+        ),
+        _timeseries(
+            "Avg NAE XML Processing Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_processing_time_seconds_sum",
+                "ciphertrust_nae_xml_processing_time_seconds_count",
+                aggregate=True,
+                series_name="XML processing",
+            ),
+            "s",
+            "Average NAE-XML processing latency (sum/count).",
+        ),
+        _timeseries(
             "NAE XML Response Samples",
             _named_series(store, "ciphertrust_nae_xml_response_time_seconds_count", rate=True),
             "samples/s",
@@ -66,6 +92,72 @@ def build_nae(store: ApplianceStore) -> list[dict[str, Any]]:
             "NAE XML Processing Samples",
             _named_series(store, "ciphertrust_nae_xml_processing_time_seconds_count", rate=True),
             "samples/s",
+        ),
+        _note(
+            "NAE XML stage timings (parse / tx / rx / exec / total) require "
+            "ENABLE_DEBUG_METRICS on the NAE service; empty charts mean the debug metrics are off.",
+            title="NAE Developer stages",
+            tone="info",
+        ),
+        _timeseries(
+            "XML Total Processing Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_total_seconds_sum",
+                "ciphertrust_nae_xml_total_seconds_count",
+                limit=8,
+                label_keys=["token"],
+            ),
+            "s",
+            "Requires ENABLE_DEBUG_METRICS.",
+        ),
+        _timeseries(
+            "XML Parsing Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_parse_seconds_sum",
+                "ciphertrust_nae_xml_parse_seconds_count",
+                limit=8,
+                label_keys=["token"],
+            ),
+            "s",
+            "Requires ENABLE_DEBUG_METRICS.",
+        ),
+        _timeseries(
+            "XML Transmit Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_tx_seconds_sum",
+                "ciphertrust_nae_xml_tx_seconds_count",
+                limit=8,
+                label_keys=["token"],
+            ),
+            "s",
+            "Requires ENABLE_DEBUG_METRICS.",
+        ),
+        _timeseries(
+            "XML Receive Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_rx_seconds_sum",
+                "ciphertrust_nae_xml_rx_seconds_count",
+                limit=8,
+                label_keys=["token"],
+            ),
+            "s",
+            "Requires ENABLE_DEBUG_METRICS.",
+        ),
+        _timeseries(
+            "XML Execution Time",
+            _avg_series(
+                store,
+                "ciphertrust_nae_xml_exec_seconds_sum",
+                "ciphertrust_nae_xml_exec_seconds_count",
+                limit=8,
+                label_keys=["token"],
+            ),
+            "s",
+            "Requires ENABLE_DEBUG_METRICS.",
         ),
     ]
 

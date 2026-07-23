@@ -545,6 +545,32 @@ def list_delete_pending_appliances() -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_cluster_members(appliance_id: int) -> list[dict[str, Any]]:
+    """Return primary + members for the cluster containing ``appliance_id``.
+
+    Standalone appliances return a single-item list. Membership is based on
+    ``parent_appliance_id`` / ``cluster_role`` (not the unused ``cluster_id``).
+    """
+    apps = list_appliances()
+    by_id = {int(a["id"]): a for a in apps}
+    selected = by_id.get(int(appliance_id))
+    if not selected:
+        return []
+    parent_id = selected.get("parent_appliance_id")
+    root_id = int(parent_id) if parent_id is not None else int(selected["id"])
+    root = by_id.get(root_id) or selected
+    children = [
+        a
+        for a in apps
+        if a.get("parent_appliance_id") is not None
+        and int(a["parent_appliance_id"]) == root_id
+    ]
+    if not children and not root.get("is_clustered") and root.get("cluster_role") != "primary":
+        return [selected]
+    children.sort(key=lambda a: ((a.get("display_name") or "").lower(), int(a["id"])))
+    return [root, *children]
+
+
 def get_appliance(appliance_id: int, include_secrets: bool = False) -> dict[str, Any] | None:
     init_db()
     with connect() as conn:
