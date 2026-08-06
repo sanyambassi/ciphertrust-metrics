@@ -282,6 +282,13 @@ form.addEventListener("submit", async (e) => {
     } else {
       formError.textContent = err.message || "Connection failed";
     }
+    // Partial connect may have persisted an appliance (pending/error) — refresh list.
+    try {
+      await loadAppliances({ force: true });
+      renderApplianceList(true);
+    } catch (_) {
+      /* ignore */
+    }
   } finally {
     window.clearTimeout(stillHint);
     btnConnect.disabled = false;

@@ -42,7 +42,7 @@ def _ensure_secret() -> str:
 
 class Config:
     # Bump on each Docker/GitHub release (semver: MAJOR.MINOR.PATCH).
-    APP_VERSION: str = os.getenv("APP_VERSION", "1.3.0")
+    APP_VERSION: str = os.getenv("APP_VERSION", "1.3.3")
     SECRET_KEY: str = _ensure_secret()
     DATABASE_PATH: Path = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "cm_metrics.db")))
     # Per-appliance metric SQLite files live here (metric_points + scrape_runs).
@@ -54,6 +54,9 @@ class Config:
     SCRAPE_INTERVAL: int = int(os.getenv("SCRAPE_INTERVAL", "60"))
     # How often to re-probe appliances marked offline (background loop otherwise skips them).
     OFFLINE_RETRY_INTERVAL: int = int(os.getenv("OFFLINE_RETRY_INTERVAL", "3600"))
+    # How often to re-probe sticky "error" (auth/login blips while a CM is recreating).
+    # Shorter than offline — credentials are usually still valid once the host finishes booting.
+    ERROR_RETRY_INTERVAL: int = int(os.getenv("ERROR_RETRY_INTERVAL", "300"))
     # REST ops snapshot (users/backups/scheduler) — slower than Prometheus scrapes.
     OPS_SNAPSHOT_INTERVAL: int = int(os.getenv("OPS_SNAPSHOT_INTERVAL", "120"))
     # Keep enough in-memory history for the UI time-range picker (up to 30d).

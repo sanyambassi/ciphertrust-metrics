@@ -779,6 +779,10 @@ def update_appliance_auth(
     if is_clustered is not None:
         fields.append("is_clustered = ?")
         values.append(1 if is_clustered else 0)
+        # Clearing clustered also drops stale primary/member role unless caller
+        # explicitly sets cluster_role in the same call.
+        if not is_clustered and cluster_role is None:
+            fields.append("cluster_role = NULL")
     if clear_parent:
         fields.append("parent_appliance_id = NULL")
     elif parent_appliance_id is not None:
@@ -882,7 +886,13 @@ def update_appliance_scrape(
     error: str | None = None,
     source: str = "live",
     mark_offline: bool = False,
+    sticky_error: bool = False,
 ) -> None:
+    """Record a scrape outcome.
+
+    ``sticky_error`` keeps status at ``error`` (and does not accumulate toward
+    the offline threshold). Used for login 401/5xx blips while a CM recreates.
+    """
     init_db()
     now = time.time()
 
@@ -900,12 +910,29 @@ def update_appliance_scrape(
             else:
                 if mark_offline:
                     fail_count = max(prev_fails + 1, OFFLINE_FAIL_THRESHOLD)
+                    status = "offline"
+                elif sticky_error:
+                    # Login recreate blips: stay on error + short retry. Clear
+                    # fail_count so is_appliance_offline()/ensure_offline_status
+                    # cannot immediately flip this row back to offline.
+                    fail_count = 0
+                    status = "error"
                 else:
                     fail_count = prev_fails + 1
-                status = "offline" if fail_count >= OFFLINE_FAIL_THRESHOLD else "error"
+                    status = "offline" if fail_count >= OFFLINE_FAIL_THRESHOLD else "error"
                 err = error
                 if status == "offline" and err:
-                    err = f"Offline after {fail_count} failed contacts: {err}"
+                    # Strip any prior offline prefix to avoid
+                    # "Offline after N: Offline after N: …" on re-mark.
+                    cleaned = str(err).strip()
+                    while cleaned.lower().startswith("offline after "):
+                        parts = cleaned.split(":", 1)
+                        cleaned = parts[1].strip() if len(parts) > 1 else ""
+                    err = (
+                        f"Offline after {fail_count} failed contacts: {cleaned}"
+                        if cleaned
+                        else f"Offline after {fail_count} failed contacts"
+                    )
                 elif status == "offline":
                     err = f"Offline after {fail_count} failed contacts"
             conn.execute(
@@ -1674,9 +1701,10 @@ def _fleet_counts_from_rows(rows: list[Any]) -> dict[str, int]:
         status = (row["last_status"] if hasattr(row, "keys") else row.get("last_status")) or ""
         if status == "ok":
             online += 1
-        elif status in {"offline", "error"}:
+        elif status == "offline":
             offline += 1
         else:
+            # pending / error / deleting — not TCP-down offline
             other += 1
     return {
         "online": online,

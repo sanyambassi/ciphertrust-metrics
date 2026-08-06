@@ -197,14 +197,15 @@ export function applianceStatusBadge(a) {
   if (a.last_status === "offline") return { cls: "offline", text: "offline" };
   if (a.last_status === "error") return { cls: "err", text: "error" };
   if (a.last_status === "delete_failed") return { cls: "err", text: "delete failed" };
-  if (a.last_status === "pending") return { cls: "", text: "retrying" };
+  // Pending is connect-in-progress / interrupted — background loop does not auto-retry it.
+  if (a.last_status === "pending") return { cls: "", text: "connecting" };
   return { cls: "", text: a.last_status || "pending" };
 }
 
 function nodeActionsHtml(a, { editTarget = "appliance", label = "" } = {}) {
-  const offline = a.last_status === "offline";
-  const syncTitle = offline ? "Retry contact" : "Sync this appliance";
-  const syncLabel = offline ? `Retry ${label}` : `Sync ${label}`;
+  const needsRetry = a.last_status === "offline" || a.last_status === "error";
+  const syncTitle = needsRetry ? "Retry contact" : "Sync this appliance";
+  const syncLabel = needsRetry ? `Retry ${label}` : `Sync ${label}`;
   const syncing = state.syncingApplianceIds?.has(a.id);
   return `
     <span class="tree-node-actions">
@@ -660,7 +661,8 @@ function applyFleetMapTiles(map) {
 function applianceMapTone(a) {
   const status = String(a.last_status || "").toLowerCase();
   if (status === "ok") return "online";
-  if (status === "pending") return "pending";
+  // Sticky error / recreate blips are retrying — not the same as TCP-down offline.
+  if (status === "pending" || status === "error") return "pending";
   return "offline";
 }
 
@@ -896,16 +898,19 @@ export async function renderFleetHealth() {
   const list = state.appliances || [];
   let online = 0;
   let offline = 0;
+  let retrying = 0;
   let unmapped = 0;
   for (const a of list) {
     const tone = applianceMapTone(a);
     if (tone === "online") online += 1;
+    else if (tone === "pending") retrying += 1;
     else offline += 1;
     if (!a.location_mapped) unmapped += 1;
   }
   if (fleetMapSummary) {
     fleetMapSummary.textContent =
       `${online} online · ${offline} offline` +
+      (retrying ? ` · ${retrying} retrying` : "") +
       (unmapped ? ` · ${unmapped} unmapped` : "") +
       (list.length ? ` · ${list.length} total` : "");
   }
@@ -1309,7 +1314,8 @@ export async function handleApplianceAction(e) {
     const id = Number(retryBtn.dataset.id);
     if (state.syncingApplianceIds.has(id)) return true;
     const appliance = state.appliances.find((a) => a.id === id);
-    const wasOffline = appliance?.last_status === "offline";
+    const wasRetry =
+      appliance?.last_status === "offline" || appliance?.last_status === "error";
     const label =
       (appliance?.display_name || "").trim() ||
       (appliance?.host || "").replace(/^https?:\/\//, "") ||
@@ -1319,21 +1325,45 @@ export async function handleApplianceAction(e) {
     state.panelMeta = null;
     renderApplianceList(true);
     try {
-      await fetchJSON(`/api/appliances/${id}/scrape?force=1`, { method: "POST" });
+      let result;
+      try {
+        result = await fetchJSON(`/api/appliances/${id}/scrape?force=1`, { method: "POST" });
+      } catch (err) {
+        // Older servers returned HTTP 400 with ok:false for unreachable hosts.
+        if (err?.payload && ("ok" in err.payload || err.payload.error)) {
+          result = err.payload;
+        } else {
+          throw err;
+        }
+      }
       await loadAppliances();
       await refreshStatus();
       if (state.viewMode === "dashboard") {
         await loadDashboard(state.dashboardId, { forceFull: true });
       }
-      showToast(
-        wasOffline ? `Retry complete · ${label}` : `Sync complete · ${label}`,
-        { type: "ok" }
-      );
+      if (result?.skipped || result?.ok === false) {
+        const detail = String(result?.error || "").trim();
+        let short;
+        if (wasRetry && !result?.skipped) {
+          short =
+            appliance?.last_status === "error"
+              ? `Still failing · ${label}`
+              : `Still offline · ${label}`;
+        } else {
+          short = `${wasRetry ? "Retry" : "Sync"} skipped · ${label}`;
+        }
+        showToast(detail ? `${short}: ${detail}` : short, { type: "err", duration: 4500 });
+      } else {
+        showToast(
+          wasRetry ? `Retry complete · ${label}` : `Sync complete · ${label}`,
+          { type: "ok" }
+        );
+      }
     } catch (err) {
       await loadAppliances();
       await refreshStatus();
       showToast(
-        err.message || (wasOffline ? `Retry failed · ${label}` : `Sync failed · ${label}`),
+        err.message || (wasRetry ? `Retry failed · ${label}` : `Sync failed · ${label}`),
         { type: "err", duration: 4500 }
       );
     } finally {

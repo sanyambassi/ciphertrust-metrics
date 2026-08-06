@@ -23,6 +23,20 @@ export function friendlyScrapeError(raw, appliance) {
   if (!msg) return { short: "Offline", detail: "" };
 
   const lower = msg.toLowerCase();
+  // Login recreate blips (Staging etc.) — check before offline. Backend sticky-
+  // retries all "Login failed (...)" statuses, so the pill must say auto-retrying
+  // even for bare 401/403 without "wrong password" text.
+  if (lower.includes("login failed")) {
+    return { short: "Login not ready — auto-retrying", detail: msg };
+  }
+  if (
+    lower.includes("ssleoferror") ||
+    lower.includes("eof occurred in violation of protocol") ||
+    lower.includes("wrong version number") ||
+    lower.includes("certificate verify failed")
+  ) {
+    return { short: "TLS not ready — auto-retrying", detail: msg };
+  }
   if (lower.startsWith("offline after") || appliance?.last_status === "offline") {
     return {
       short: `Offline · ${host}`,
@@ -49,7 +63,7 @@ export function friendlyScrapeError(raw, appliance) {
   if (lower.includes("ssl") || lower.includes("certificate")) {
     return { short: `TLS error · ${host}`, detail: msg };
   }
-  if (lower.includes("401") || lower.includes("unauthorized") || lower.includes("login failed")) {
+  if (lower.includes("401") || lower.includes("unauthorized")) {
     return { short: "Auth failed — reconnect", detail: msg };
   }
   if (lower.includes("403") || lower.includes("forbidden")) {
@@ -132,6 +146,17 @@ export async function refreshStatus() {
       const age = relativeAge(state.lastScrapeAt);
       statusText.textContent = age ? `${short} · ${age}` : short;
       if (detail) statusPill.title = detail;
+    } else if (current?.last_status === "pending") {
+      stopScrapeAgeTicker();
+      state.lastScrapeAt = current.last_scrape_at ?? null;
+      statusPill.classList.add("warn");
+      statusText.textContent = "connecting…";
+      statusPill.title = current.last_error || "Connect / scrape in progress";
+    } else if (current?.last_status === "delete_failed") {
+      stopScrapeAgeTicker();
+      statusPill.classList.add("err");
+      statusText.textContent = "delete failed";
+      if (current.last_error) statusPill.title = current.last_error;
     } else {
       stopScrapeAgeTicker();
       state.lastScrapeAt = null;

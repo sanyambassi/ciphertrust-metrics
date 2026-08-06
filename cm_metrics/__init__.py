@@ -162,13 +162,18 @@ def create_app() -> Flask:
 
     @app.post("/api/appliances/<int:appliance_id>/scrape")
     def api_scrape_appliance(appliance_id: int):
-        # Manual refresh always forces a retry (clears offline / fail counter).
+        # Manual refresh always force-retries. fail_count is cleared for offline/
+        # pending hosts; sticky "error" keeps fail_count so non-auth faults can tip offline.
         force = request.args.get("force", "1").lower() not in {"0", "false", "no"}
         result = scraper.scrape_appliance(appliance_id, force=force)
-        if result.get("skipped"):
-            return jsonify(result), 200
-        code = 200 if result.get("ok") or result.get("source") == "demo" else 400
-        return jsonify(result), code
+        err = str(result.get("error") or "").strip().lower()
+        if err == "not found":
+            return jsonify(result), 404
+        if err == "disabled":
+            return jsonify(result), 400
+        # Probe finished (or was skipped). ``ok`` is appliance health, not HTTP success —
+        # returning 400 here made the UI treat expected offline retries as hard failures.
+        return jsonify(result), 200
 
     @app.post("/api/appliances/<int:appliance_id>/discover-cluster")
     def api_discover_cluster(appliance_id: int):

@@ -9,9 +9,10 @@ from urllib.parse import urlparse
 
 from ..store import ApplianceStore
 from .panels import (
+    _named_series,
+    _series_since,
     _stat,
     _timeseries,
-    _named_series,
 )
 
 # ~2–3 scrape cycles — samples older than this are treated as stale for "now" views.
@@ -204,7 +205,9 @@ def _fleet_time_since_connect(
     host_names: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Connection age only while ``ciphertrust_cluster_connected`` is 1 at that scrape."""
-    since = time.time() - 7200.0
+    since = _series_since()
+    if since is None:
+        since = time.time() - 7200.0
     merged: list[dict[str, Any]] = []
     for member, store in member_stores:
         origin = _node_label(member)
@@ -309,12 +312,33 @@ def _fleet_peer_table(
                 was = "Yes" if connected >= 1 else "No"
                 connected_cell = f"Stale (was {was})"
                 uptime_cell = "—"
+                if blocked is not None:
+                    blocked_cell = f"Stale (was {'Yes' if blocked >= 1 else 'No'})"
+                else:
+                    blocked_cell = "—"
+                last_conn_cell = "—"
             elif connected >= 1:
                 connected_cell = "Yes"
                 uptime_cell = _fmt_duration(uptime)
+                blocked_cell = (
+                    "Yes"
+                    if blocked is not None and blocked >= 1
+                    else "No"
+                    if blocked is not None
+                    else "—"
+                )
+                last_conn_cell = _fmt_connect_time(connect_ts)
             else:
                 connected_cell = "No"
                 uptime_cell = "—"
+                blocked_cell = (
+                    "Yes"
+                    if blocked is not None and blocked >= 1
+                    else "No"
+                    if blocked is not None
+                    else "—"
+                )
+                last_conn_cell = _fmt_connect_time(connect_ts)
             rows.append(
                 {
                     "Origin Node": origin,
@@ -322,14 +346,8 @@ def _fleet_peer_table(
                     "Origin status": origin_status,
                     "Data": "Stale" if stale else "Live",
                     "Connected?": connected_cell,
-                    "Replication Blocked?": (
-                        "Yes"
-                        if blocked is not None and blocked >= 1
-                        else "No"
-                        if blocked is not None
-                        else "—"
-                    ),
-                    "Last Connected": _fmt_connect_time(connect_ts),
+                    "Replication Blocked?": blocked_cell,
+                    "Last Connected": last_conn_cell,
                     "Uptime": uptime_cell,
                 }
             )
@@ -360,23 +378,28 @@ def _pick_ops_source(
     member_stores: list[tuple[dict[str, Any], ApplianceStore]],
     appliance: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Prefer a reachable member's ops snapshot for raft/status tiles."""
-    # Prefer primary (index 0) when reachable.
+    """Return a reachable member's ops snapshot for raft/status tiles.
+
+    Never fall back to an offline member's last snapshot — that paints stale
+    ``up`` / ``ready`` as if the cluster were live.
+    """
     ordered = list(member_stores)
+    # Prefer a reachable member that still has cluster_api details.
     for member, _ in ordered:
-        if not _member_unreachable(member):
-            ops = member.get("ops_snapshot") if isinstance(member, dict) else None
-            if isinstance(ops, dict) and ops.get("cluster_api"):
-                return ops
+        if _member_unreachable(member):
+            continue
+        ops = member.get("ops_snapshot") if isinstance(member, dict) else None
+        if isinstance(ops, dict) and ops.get("cluster_api"):
+            return ops
     for member, _ in ordered:
-        if not _member_unreachable(member):
-            ops = member.get("ops_snapshot") if isinstance(member, dict) else None
-            if isinstance(ops, dict):
-                return ops
-    if appliance and isinstance(appliance.get("ops_snapshot"), dict):
-        return appliance["ops_snapshot"]
-    if ordered:
-        ops = ordered[0][0].get("ops_snapshot") if isinstance(ordered[0][0], dict) else None
+        if _member_unreachable(member):
+            continue
+        ops = member.get("ops_snapshot") if isinstance(member, dict) else None
+        if isinstance(ops, dict):
+            return ops
+    # Selected appliance only if it is currently reachable.
+    if appliance and not _member_unreachable(appliance):
+        ops = appliance.get("ops_snapshot")
         if isinstance(ops, dict):
             return ops
     return {}
@@ -423,7 +446,30 @@ def build_cluster(
     api_err = cluster_api.get("error")
 
     fleet = len(member_stores) > 1
+    live_ops = bool(ops)
     peer_table = _fleet_peer_table(member_stores, host_names)
+
+    if live_ops:
+        raft_val: float | str | None = raft if isinstance(raft, (str, int, float)) else None
+        status_val: float | str | None = (
+            status if isinstance(status, (str, int, float)) else None
+        )
+        node_id_val: float | str | None = (
+            node_id if isinstance(node_id, (str, int, float)) else None
+        )
+        raft_desc = ""
+        status_desc = ""
+        node_desc = ""
+        ops_tone = ""
+    else:
+        # No reachable member — do not echo last-known up/ready.
+        raft_val = "—"
+        status_val = "—"
+        node_id_val = "—"
+        raft_desc = "Unavailable — no reachable cluster members"
+        status_desc = raft_desc
+        node_desc = raft_desc
+        ops_tone = "fail" if fleet or reachable == 0 else ""
 
     panels: list[dict[str, Any]] = [
         _stat(
@@ -437,11 +483,13 @@ def build_cluster(
             description=f"{reachable} of {len(member_stores)} members scraping OK",
             tone="fail" if fleet and reachable < len(member_stores) else "",
         ),
-        _stat("Raft Status", raft if isinstance(raft, (str, int, float)) else None),
-        _stat("Node Status", status if isinstance(status, (str, int, float)) else None),
+        _stat("Raft Status", raft_val, description=raft_desc, tone=ops_tone),
+        _stat("Node Status", status_val, description=status_desc, tone=ops_tone),
         _stat(
             "Primary Node ID" if fleet else "This Node ID",
-            node_id if isinstance(node_id, (str, int, float)) else None,
+            node_id_val,
+            description=node_desc,
+            tone=ops_tone,
         ),
         peer_table,
     ]

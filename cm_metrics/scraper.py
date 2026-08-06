@@ -82,23 +82,100 @@ def _is_connectivity_error(exc: BaseException | str) -> bool:
     ):
         return True
     msg = (str(exc) if not isinstance(exc, str) else exc).lower()
+    # Structured CM HTTP failures (login/GET/POST/metrics) are application-layer.
+    # Do not treat "504 Gateway Timeout" / "503 … Unavailable" bodies as transport down.
+    if "login failed (" in msg or "metrics scrape failed (" in msg:
+        return False
+    if " failed (" in msg and ("get /" in msg or "post /" in msg):
+        return False
     needles = (
         "timed out",
-        "timeout",
+        "connecttimeout",
+        "read timed out",
+        "connection timed out",
         "connection refused",
         "connection reset",
+        "connection aborted",
+        "remotedisconnected",
+        "remote end closed",
         "name or service not known",
         "nodename nor servname",
         "failed to resolve",
         "name resolution",
         "network is unreachable",
+        "host is unreachable",
+        "host unreachable",
         "no route to host",
         "max retries exceeded",
-        "temporarily unavailable",
-        "unreachable",
+        # OS/EAGAIN style — not HTTP "503 Service Temporarily Unavailable"
+        "resource temporarily unavailable",
         "tcp unreachable",
     )
     return any(n in msg for n in needles)
+
+
+def _strip_offline_prefix(err: str) -> str:
+    """Avoid 'Offline after N: Offline after N: …' when re-marking offline."""
+    text = (err or "").strip()
+    prefix = "offline after "
+    while text.lower().startswith(prefix):
+        # "Offline after 5 failed contacts: rest"
+        parts = text.split(":", 1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+    return text
+
+
+def _is_auth_error(exc: BaseException | str) -> bool:
+    """True for login/credential rejections (often transient while a CM is recreating).
+
+    Intentionally does **not** treat every HTTP 401/403 as a login blip — e.g.
+    ``Metrics scrape failed (401)`` should not get the short recreate retry.
+    """
+    msg = (str(exc) if not isinstance(exc, str) else exc).lower()
+    needles = (
+        "wrong username or password",
+        "ncerrunauthorized",
+        "login failed (401)",
+        "login failed (403)",
+        # CM JSON often embeds codeDesc NCERRUnauthorizedAccess (covered above).
+        # Do not match bare "unauthorized access" — proxies/WAF pages over-match.
+    )
+    if any(n in msg for n in needles):
+        return True
+    status = getattr(exc, "status_code", None)
+    return status in {401, 403} and "login failed" in msg
+
+
+def _is_tls_boot_error(exc: BaseException | str) -> bool:
+    """TLS handshake flaps while a CM is booting/recreating (verify is off)."""
+    if isinstance(exc, requests.exceptions.SSLError):
+        return True
+    msg = (str(exc) if not isinstance(exc, str) else exc).lower()
+    needles = (
+        "ssleoferror",
+        "ssl: unexpected_eof",
+        "eof occurred in violation of protocol",
+        "wrong version number",
+        "certificate verify failed",
+        "sslv3_alert",
+        "tlsv1_alert",
+    )
+    return any(n in msg for n in needles)
+
+
+def _is_transient_login_error(exc: BaseException | str) -> bool:
+    """Auth rejects, login 5xx, or TLS flaps while CM is not ready after recreate."""
+    if _is_auth_error(exc):
+        return True
+    if _is_tls_boot_error(exc):
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 500:
+        msg = (str(exc) if not isinstance(exc, str) else exc).lower()
+        if "login failed" in msg:
+            return True
+    msg = (str(exc) if not isinstance(exc, str) else exc).lower()
+    return "login failed (5" in msg
 
 
 # Reuse a compact demo template for optional offline testing
@@ -232,7 +309,14 @@ class MetricsScraper:
 
     def invalidate_client(self, appliance_id: int) -> None:
         with self._lock:
-            self._clients.pop(appliance_id, None)
+            client = self._clients.pop(appliance_id, None)
+        if client is not None:
+            # Drop pooled HTTPS connections — otherwise failed scrapes orphan
+            # sessions until GC (contributed to multi-GB RSS growth).
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def connect_appliance(
         self,
@@ -294,88 +378,128 @@ class MetricsScraper:
         cloud: str | None = None,
     ) -> tuple[dict[str, Any], Any]:
         client = CMClient(host=host, username=username, password=password, domain=domain)
-        client.login()
-        metrics_token = client.ensure_metrics_token()
-        info = {}
+        registered = False
         try:
-            info = client.system_info()
-        except CMClientError:
-            pass
+            client.login()
+            metrics_token = client.ensure_metrics_token()
+            info = {}
+            try:
+                info = client.system_info()
+            except CMClientError:
+                pass
 
-        appliance = db.create_or_update_appliance(
-            host=client.host,
-            username=username,
-            password=password,
-            display_name=display_name,
-            domain=domain,
-            location=location,
-            cloud=cloud,
-        )
-        aid = int(appliance["id"])
-        db.update_appliance_auth(
-            aid,
-            jwt=client.jwt,
-            jwt_expires_at=client.jwt_expires_at,
-            metrics_token=metrics_token,
-            node_host=urlparse(client.host).hostname,
-        )
-        if info:
-            db.update_appliance_system_info(aid, info)
-        try:
-            # Standalone private IP from NIC config (no-op if clustered / already set).
-            self._maybe_fill_standalone_private_ip(aid, db.get_appliance(aid) or appliance, client)
-        except CMClientError:
-            pass
-        try:
-            snap = client.fetch_ops_snapshot()
-            if snap:
-                db.update_appliance_ops_snapshot(aid, snap)
-        except CMClientError:
-            pass
-        self.invalidate_client(aid)
-        self._clients[aid] = client
+            appliance = db.create_or_update_appliance(
+                host=client.host,
+                username=username,
+                password=password,
+                display_name=display_name,
+                domain=domain,
+                location=location,
+                cloud=cloud,
+            )
+            aid = int(appliance["id"])
+            db.update_appliance_auth(
+                aid,
+                jwt=client.jwt,
+                jwt_expires_at=client.jwt_expires_at,
+                metrics_token=metrics_token,
+                node_host=urlparse(client.host).hostname,
+            )
+            if info:
+                db.update_appliance_system_info(aid, info)
+            try:
+                # Standalone private IP from NIC config (no-op if clustered / already set).
+                self._maybe_fill_standalone_private_ip(aid, db.get_appliance(aid) or appliance, client)
+            except CMClientError:
+                pass
+            try:
+                snap = client.fetch_ops_snapshot()
+                if snap:
+                    db.update_appliance_ops_snapshot(aid, snap)
+            except CMClientError:
+                pass
+            self.invalidate_client(aid)
+            self._clients[aid] = client
+            registered = True
 
-        # Initial scrape into memory + status; SQLite history flush is deferred.
-        samples = client.scrape_metrics(metrics_token)
-        store = self.store.for_appliance(aid, hydrate=False)
-        store.ingest(samples, source="live", persist=False)
-        db.update_appliance_scrape(aid, ok=True, sample_count=len(samples), source="live")
+            # Initial scrape into memory + status; SQLite history flush is deferred.
+            # If this fails after create_or_update (which sets pending), persist a real
+            # error/offline status so the row is not stuck pending until recover_stuck.
+            try:
+                samples = client.scrape_metrics(metrics_token)
+                store = self.store.for_appliance(aid, hydrate=False)
+                store.ingest(samples, source="live", persist=False)
+                db.update_appliance_scrape(aid, ok=True, sample_count=len(samples), source="live")
+            except Exception as exc:  # noqa: BLE001
+                self.invalidate_client(aid)
+                registered = False
+                transient = _is_transient_login_error(exc)
+                down = _is_connectivity_error(exc) and not transient
+                try:
+                    db.update_appliance_scrape(
+                        aid,
+                        ok=False,
+                        sample_count=0,
+                        error=str(exc),
+                        source="error",
+                        mark_offline=down,
+                        sticky_error=transient,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Could not persist connect scrape failure for appliance %s",
+                        aid,
+                        exc_info=True,
+                    )
+                raise
 
-        # Prefetch ksctl from this CM's public /downloads zip (no auth) for healthcheck.
-        try:
-            from . import healthcheck_runner
+            # Prefetch ksctl from this CM's public /downloads zip (no auth) for healthcheck.
+            try:
+                from . import healthcheck_runner
 
-            healthcheck_runner.ensure_ksctl_async(client.host)
-        except Exception:  # noqa: BLE001
-            logger.debug("ksctl prefetch schedule failed", exc_info=True)
+                healthcheck_runner.ensure_ksctl_async(client.host)
+            except Exception:  # noqa: BLE001
+                logger.debug("ksctl prefetch schedule failed", exc_info=True)
 
-        peers: list[dict[str, Any]] = []
-        added_peers: list[dict[str, Any]] = []
-        try:
-            peers = client.discover_cluster_hosts(samples)
-            db.replace_cluster_peers(aid, peers, source="api+metrics")
-            clustered = len([p for p in peers if p.get("source") != "self"]) > 0
-            db.update_appliance_auth(aid, is_clustered=clustered)
-            if discover_cluster and clustered:
-                added_peers = self._auto_add_peers(appliance, peers, username, password, domain)
-        except CMClientError as exc:
-            logger.warning("Cluster discovery failed for %s: %s", client.host, exc)
+            peers: list[dict[str, Any]] = []
+            added_peers: list[dict[str, Any]] = []
+            try:
+                peers = client.discover_cluster_hosts(samples)
+                db.replace_cluster_peers(aid, peers, source="api+metrics")
+                # API self-nodes keep source="api" — use is_this_node, not source!="self".
+                clustered = any(not p.get("is_this_node") for p in peers)
+                db.update_appliance_auth(
+                    aid,
+                    is_clustered=clustered,
+                    cluster_role="primary" if clustered else None,
+                )
+                if discover_cluster and clustered:
+                    added_peers = self._auto_add_peers(appliance, peers, username, password, domain)
+            except CMClientError as exc:
+                logger.warning("Cluster discovery failed for %s: %s", client.host, exc)
 
-        appliance = db.get_appliance(aid)
-        try:
-            db.record_fleet_health_sample(force=True)
-        except Exception:  # noqa: BLE001
-            logger.debug("fleet health sample after connect failed", exc_info=True)
-        return (
-            {
-                "appliance": appliance,
-                "sample_count": len(samples),
-                "system_info": info,
-                "cluster_peers": peers,
-                "auto_added": added_peers,
-            },
-            store,
-        )
+            appliance = db.get_appliance(aid)
+            try:
+                db.record_fleet_health_sample(force=True)
+            except Exception:  # noqa: BLE001
+                logger.debug("fleet health sample after connect failed", exc_info=True)
+            return (
+                {
+                    "appliance": appliance,
+                    "sample_count": len(samples),
+                    "system_info": info,
+                    "cluster_peers": peers,
+                    "auto_added": added_peers,
+                },
+                store,
+            )
+        except Exception:
+            if not registered:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
 
     def _auto_add_peers(
         self,
@@ -514,12 +638,18 @@ class MetricsScraper:
                         private_host=private_host or None,
                     )
                     db.update_appliance_display_name(int(discovered["id"]), auto_name)
+                    # Classify from the raw exception — never put "unreachable" in the
+                    # stored message (that needle used to poison later scrape_all
+                    # promotions into offline for non-transport failures).
+                    transient_login = _is_transient_login_error(exc)
+                    down = _is_connectivity_error(exc) and not transient_login
                     db.update_appliance_scrape(
                         int(discovered["id"]),
                         ok=False,
-                        error=f"Cluster peer unreachable via {scrape_host}: {exc}",
+                        error=f"Cluster peer connect failed via {scrape_host}: {exc}",
                         source="discovery",
-                        mark_offline=_is_connectivity_error(exc),
+                        mark_offline=down,
+                        sticky_error=transient_login,
                     )
                     added.append(db.get_appliance(int(discovered["id"])) or discovered)
 
@@ -539,7 +669,10 @@ class MetricsScraper:
             timeout=timeout or 30.0,
         )
         client.metrics_token = token
-        return client.scrape_metrics(token)
+        try:
+            return client.scrape_metrics(token)
+        finally:
+            client.close()
 
     def _client_from_stored_jwt(self, appliance: dict[str, Any]) -> CMClient | None:
         """Build a client that can call REST using a still-valid stored JWT (no password)."""
@@ -876,16 +1009,21 @@ class MetricsScraper:
                 "fail_count": int(appliance.get("fail_count") or 0),
             }
         # Capture before reset — used to apply a short connect budget only for retries.
-        was_unreachable = (appliance.get("last_status") or "") in {
+        prev_status = (appliance.get("last_status") or "").lower()
+        was_unreachable = prev_status in {
             "offline",
             "pending",
             "error",
         } or db.is_appliance_offline(appliance)
-        if force:
+        # Clear fail_count for offline/pending re-probes and manual Refresh of
+        # healthy/offline hosts. Do not reset when retrying sticky "error" — that
+        # would prevent non-auth failures from ever reaching the offline threshold.
+        if force and prev_status != "error":
             db.reset_appliance_failures(appliance_id)
 
         # Fast-fail blackholed / firewalled hosts before HTTP (which can hang far
         # longer than requests' timeout on some kernels when SYNs are dropped).
+        # TCP down = actually unreachable → offline (hourly), never sticky error.
         host_up = True
         if force and was_unreachable:
             host_up = _tcp_reachable(str(appliance.get("host") or ""), timeout=3.0)
@@ -913,10 +1051,8 @@ class MetricsScraper:
         try:
             samples: list[Any]
             if decrypt_error:
-                samples = self._scrape_with_metrics_token(
-                    appliance,
-                    timeout=10.0 if (force and was_unreachable and not host_up) else 30.0,
-                )
+                # TCP-down already returned above; use a normal scrape budget.
+                samples = self._scrape_with_metrics_token(appliance, timeout=30.0)
             else:
                 client = self._get_client(appliance)
                 # Unreachable (TCP down) already returned above. Reachable hosts —
@@ -971,12 +1107,13 @@ class MetricsScraper:
                     peers = client.discover_cluster_hosts(samples)
                     if peers:
                         db.replace_cluster_peers(appliance_id, peers)
-                        clustered = len([p for p in peers if not p.get("is_this_node")]) > 0
+                        clustered = any(not p.get("is_this_node") for p in peers)
                         if not appliance.get("parent_appliance_id"):
+                            # Do not latch is_clustered forever — clear when standalone again.
                             db.update_appliance_auth(
                                 appliance_id,
-                                is_clustered=clustered or bool(appliance.get("is_clustered")),
-                                cluster_role="primary" if clustered else appliance.get("cluster_role"),
+                                is_clustered=clustered,
+                                cluster_role="primary" if clustered else None,
                             )
                             if clustered and appliance.get("password"):
                                 self._auto_add_peers(
@@ -1026,16 +1163,25 @@ class MetricsScraper:
                     )
             else:
                 # Still extract peers from metrics labels without REST login
+                peer_client = None
                 try:
-                    client = CMClient(host=appliance["host"], username="x", password="x")
-                    peers = client.discover_cluster_hosts(samples)
+                    peer_client = CMClient(host=appliance["host"], username="x", password="x")
+                    peers = peer_client.discover_cluster_hosts(samples)
                     if peers:
                         db.replace_cluster_peers(appliance_id, peers, source="metrics")
-                        clustered = len([p for p in peers if p.get("source") != "self"]) > 0
-                        db.update_appliance_auth(appliance_id, is_clustered=clustered)
+                        clustered = any(not p.get("is_this_node") for p in peers)
+                        db.update_appliance_auth(
+                            appliance_id,
+                            is_clustered=clustered,
+                            cluster_role="primary" if clustered else None,
+                        )
                 except Exception:  # noqa: BLE001
                     pass
+                finally:
+                    if peer_client is not None:
+                        peer_client.close()
                 # /v1/system/info via stored JWT when password decrypt failed
+                jwt_client = None
                 try:
                     jwt_client = self._client_from_stored_jwt(appliance)
                     if jwt_client:
@@ -1046,6 +1192,9 @@ class MetricsScraper:
                         appliance_id,
                         exc,
                     )
+                finally:
+                    if jwt_client is not None:
+                        jwt_client.close()
 
             # CRDP container scrapes only need stored metrics_url (no CM password).
             try:
@@ -1085,19 +1234,21 @@ class MetricsScraper:
                 [], source="error", error=str(exc)
             )
             try:
-                # Unreachable hosts → offline immediately (not sticky "error").
-                # Auth/config failures stay "error" so the UI distinguishes them.
-                # Background scrape_all skips offline/error; without mark_offline,
-                # fail_count would never reach the threshold and status would stick
-                # on error forever after the first timeout.
+                # Actually down (TCP/timeout/connection) → offline, hourly retry.
+                # Login 401/403/5xx while a CM recreates → sticky error, 5m retry.
+                # Everything else increments fail_count toward offline.
+                # Login wins over connectivity needles (e.g. login 503 bodies that
+                # say "Service Temporarily Unavailable").
+                transient_login = _is_transient_login_error(exc)
+                down = _is_connectivity_error(exc) and not transient_login
                 db.update_appliance_scrape(
                     appliance_id,
                     ok=False,
                     sample_count=0,
                     error=str(exc),
                     source="error",
-                    mark_offline=_is_connectivity_error(exc)
-                    or bool(force and was_unreachable),
+                    mark_offline=down,
+                    sticky_error=transient_login,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -1111,21 +1262,26 @@ class MetricsScraper:
         """Scrape every enabled appliance.
 
         Background loop (force=False) keeps healthy hosts fresh, skips pending/
-        deleting, and re-probes offline hosts about once per
-        ``OFFLINE_RETRY_INTERVAL`` (default 1h). Manual Refresh uses force=True.
+        deleting, re-probes offline hosts about once per
+        ``OFFLINE_RETRY_INTERVAL`` (default 1h), and re-probes *login*
+        sticky-errors about once per ``ERROR_RETRY_INTERVAL`` (default 5m).
+        TCP/timeout/connection failures are always offline (hourly), not the
+        short login retry — avoids false "recovering" when a host is down.
+        Manual Refresh uses force=True.
         """
         enabled = [a for a in db.list_appliances() if a.get("enabled")]
         results: list[dict[str, Any]] = []
         now = time.time()
         offline_retry = max(60, int(Config.OFFLINE_RETRY_INTERVAL))
+        error_retry = max(60, int(Config.ERROR_RETRY_INTERVAL))
 
         if not force:
             for appliance in enabled:
                 status = (appliance.get("last_status") or "").lower()
                 aid = int(appliance["id"])
                 # Background loop only keeps healthy hosts fresh. Offline hosts
-                # get a slow hourly re-probe; error/pending wait for Refresh so
-                # a sick peer cannot hold scrape locks / DB writers for minutes.
+                # get a slow hourly re-probe; sticky error gets a shorter retry
+                # (recreate/login blips). Pending/deleting wait for Refresh.
                 if status in {
                     "offline",
                     "error",
@@ -1146,44 +1302,106 @@ class MetricsScraper:
                         )
                         continue
 
-                    # Stuck "error" from a timeout never reaches offline because
-                    # background skips retries — promote clear connectivity failures.
-                    if status == "error" and _is_connectivity_error(
-                        str(appliance.get("last_error") or "")
+                    last_err = str(appliance.get("last_error") or "")
+                    # Keep fail_count-offline rows honest in last_status.
+                    # Never coerce an explicit sticky login "error" back to offline
+                    # just because fail_count was already high from earlier faults.
+                    if (
+                        status not in {"offline", "error"}
+                        and db.is_appliance_offline(appliance)
+                    ):
+                        db.ensure_offline_status(aid)
+                        status = "offline"
+                    elif status == "error" and db.is_appliance_offline(appliance):
+                        if _is_transient_login_error(last_err):
+                            # Heal legacy rows: login blip + high fail_count.
+                            db.reset_appliance_failures(aid)
+                            appliance = db.get_appliance(aid) or appliance
+                        else:
+                            db.ensure_offline_status(aid)
+                            status = "offline"
+                    # Connectivity-looking sticky "error" = actually down → offline.
+                    # Never promote login recreate blips (even if the body mentions
+                    # "unavailable"/timeout-ish text).
+                    if (
+                        status == "error"
+                        and _is_connectivity_error(last_err)
+                        and not _is_transient_login_error(last_err)
                     ):
                         try:
                             db.update_appliance_scrape(
                                 aid,
                                 ok=False,
                                 sample_count=0,
-                                error=str(appliance.get("last_error") or "unreachable"),
+                                error=_strip_offline_prefix(last_err) or "unreachable",
                                 source="error",
                                 mark_offline=True,
                             )
                         except Exception:  # noqa: BLE001
                             pass
                         status = "offline"
-                    elif status != "offline" and db.is_appliance_offline(appliance):
-                        db.ensure_offline_status(aid)
-                        status = "offline"
+                        # Re-read age after promote so we don't immediately re-probe
+                        # solely because the in-memory last_scrape_at was stale.
+                        appliance = db.get_appliance(aid) or appliance
+
+                    last = float(
+                        appliance.get("last_scrape_at")
+                        or appliance.get("updated_at")
+                        or 0
+                    )
+                    age = now - last if last > 0 else max(offline_retry, error_retry)
 
                     # Offline (or fail_count past threshold): re-probe about once an hour.
+                    # Exception: last_error still looks like a login recreate blip
+                    # (misclassified / legacy wrapper text) → short retry instead.
                     if status == "offline" or db.is_appliance_offline(appliance):
-                        last = float(
-                            appliance.get("last_scrape_at")
-                            or appliance.get("updated_at")
-                            or 0
+                        offline_due = (
+                            error_retry
+                            if _is_transient_login_error(last_err)
+                            else offline_retry
                         )
-                        age = now - last if last > 0 else offline_retry
-                        if age >= offline_retry:
+                        if age >= offline_due:
                             logger.info(
-                                "Hourly offline re-probe for appliance %s (last contact %.0fs ago)",
+                                "%s offline re-probe for appliance %s (last contact %.0fs ago)",
+                                "Login-flavored"
+                                if offline_due == error_retry
+                                else "Hourly",
                                 aid,
                                 age,
                             )
                             results.append(self.scrape_appliance(aid, force=True))
                             time.sleep(0.5)
                             continue
+
+                    # Login blips (recreate): short retry only.
+                    if (
+                        status == "error"
+                        and _is_transient_login_error(last_err)
+                        and age >= error_retry
+                    ):
+                        logger.info(
+                            "Login-error re-probe for appliance %s (last contact %.0fs ago): %s",
+                            aid,
+                            age,
+                            last_err[:120],
+                        )
+                        results.append(self.scrape_appliance(aid, force=True))
+                        time.sleep(0.5)
+                        continue
+
+                    # Other non-login errors: do not use the 5m path (avoids false
+                    # "recovering" when a host is sick/down). Re-probe hourly so
+                    # they are not stuck until a manual Refresh forever.
+                    if status == "error" and age >= offline_retry:
+                        logger.info(
+                            "Hourly error re-probe for appliance %s (last contact %.0fs ago): %s",
+                            aid,
+                            age,
+                            last_err[:120],
+                        )
+                        results.append(self.scrape_appliance(aid, force=True))
+                        time.sleep(0.5)
+                        continue
 
                     results.append(
                         {

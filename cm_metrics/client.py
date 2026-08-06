@@ -102,39 +102,46 @@ def scrape_crdp_metrics(
     adapter = HTTPAdapter(max_retries=retry, pool_maxsize=2)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    resp = None
     try:
-        resp = session.get(
-            url,
-            headers={"Accept": "text/plain"},
-            timeout=timeout,
-            verify=False,
-            allow_redirects=True,
-        )
-    except requests.exceptions.SSLError as exc:
-        raise CRDPMetricsError(
-            f"CRDP HTTPS scrape failed (verify is off; check URL/TLS): {exc}"
-        ) from exc
-    except requests.RequestException as exc:
-        raise CRDPMetricsError(f"CRDP metrics unreachable ({scheme}): {exc}") from exc
-    finally:
-        session.close()
+        try:
+            resp = session.get(
+                url,
+                headers={"Accept": "text/plain"},
+                timeout=timeout,
+                verify=False,
+                allow_redirects=True,
+            )
+        except requests.exceptions.SSLError as exc:
+            raise CRDPMetricsError(
+                f"CRDP HTTPS scrape failed (verify is off; check URL/TLS): {exc}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise CRDPMetricsError(f"CRDP metrics unreachable ({scheme}): {exc}") from exc
 
-    if resp.status_code == 412:
-        raise CRDPMetricsError(
-            "Performance Metrics is not enabled",
-            status_code=412,
-            disabled=True,
-        )
-    if resp.status_code >= 400:
-        raise CRDPMetricsError(
-            f"CRDP /metrics failed ({resp.status_code}): {resp.text[:300]}",
-            status_code=resp.status_code,
-        )
-    samples = parse_prometheus_text(resp.text)
-    if extra_labels:
-        for sample in samples:
-            sample.labels = {**extra_labels, **sample.labels}
-    return samples
+        if resp.status_code == 412:
+            raise CRDPMetricsError(
+                "Performance Metrics is not enabled",
+                status_code=412,
+                disabled=True,
+            )
+        if resp.status_code >= 400:
+            raise CRDPMetricsError(
+                f"CRDP /metrics failed ({resp.status_code}): {resp.text[:300]}",
+                status_code=resp.status_code,
+            )
+        samples = parse_prometheus_text(resp.text)
+        if extra_labels:
+            for sample in samples:
+                sample.labels = {**extra_labels, **sample.labels}
+        return samples
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+        session.close()
 
 
 class CMClient:
@@ -161,6 +168,13 @@ class CMClient:
         self.metrics_token: str | None = None
         self.session = _session_no_retries()
 
+    def close(self) -> None:
+        """Release the underlying requests session / connection pool."""
+        try:
+            self.session.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def set_timeout(self, timeout: float) -> None:
         """Tighten/loosen HTTP timeouts (e.g. shorter on manual Refresh retries)."""
         self.timeout = max(3.0, float(timeout))
@@ -174,20 +188,26 @@ class CMClient:
         if self.domain:
             body["domain"] = self.domain
         resp = self.session.post(f"{self.base}/auth/tokens/", json=body, timeout=self.timeout)
-        if resp.status_code >= 400:
-            raise CMClientError(
-                f"Login failed ({resp.status_code}): {resp.text[:300]}",
-                status_code=resp.status_code,
-                payload=_safe_json(resp),
-            )
-        data = resp.json()
-        jwt = data.get("jwt") or data.get("token")
-        if not jwt:
-            raise CMClientError("Login response missing jwt", payload=data)
-        duration = float(data.get("duration") or 300)
-        self.jwt = jwt
-        self.jwt_expires_at = time.time() + max(60.0, duration - 30.0)
-        return data
+        try:
+            if resp.status_code >= 400:
+                raise CMClientError(
+                    f"Login failed ({resp.status_code}): {resp.text[:300]}",
+                    status_code=resp.status_code,
+                    payload=_safe_json(resp),
+                )
+            data = resp.json()
+            jwt = data.get("jwt") or data.get("token")
+            if not jwt:
+                raise CMClientError("Login response missing jwt", payload=data)
+            duration = float(data.get("duration") or 300)
+            self.jwt = jwt
+            self.jwt_expires_at = time.time() + max(60.0, duration - 30.0)
+            return data
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def ensure_auth(self) -> None:
         if self.jwt and time.time() < self.jwt_expires_at:
@@ -202,37 +222,61 @@ class CMClient:
     def get_json(self, path: str, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.base}{path}"
         resp = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout, **kwargs)
-        if resp.status_code == 401:
-            self.login()
-            resp = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout, **kwargs)
-        if resp.status_code >= 400:
-            raise CMClientError(
-                f"GET {path} failed ({resp.status_code}): {resp.text[:300]}",
-                status_code=resp.status_code,
-                payload=_safe_json(resp),
-            )
-        if not resp.content:
-            return None
-        return resp.json()
+        try:
+            if resp.status_code == 401:
+                resp.close()
+                self.login()
+                resp = self.session.get(
+                    url, headers=self._auth_headers(), timeout=self.timeout, **kwargs
+                )
+            if resp.status_code >= 400:
+                raise CMClientError(
+                    f"GET {path} failed ({resp.status_code}): {resp.text[:300]}",
+                    status_code=resp.status_code,
+                    payload=_safe_json(resp),
+                )
+            if not resp.content:
+                return None
+            return resp.json()
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def post_json(self, path: str, body: dict | None = None, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.base}{path}"
-        resp = self.session.post(url, headers=self._auth_headers(), json=body or {}, timeout=self.timeout, **kwargs)
-        if resp.status_code == 401:
-            self.login()
-            resp = self.session.post(url, headers=self._auth_headers(), json=body or {}, timeout=self.timeout, **kwargs)
-        if resp.status_code >= 400:
-            raise CMClientError(
-                f"POST {path} failed ({resp.status_code}): {resp.text[:300]}",
-                status_code=resp.status_code,
-                payload=_safe_json(resp),
-            )
-        if not resp.content:
-            return None
+        resp = self.session.post(
+            url, headers=self._auth_headers(), json=body or {}, timeout=self.timeout, **kwargs
+        )
         try:
-            return resp.json()
-        except Exception:  # noqa: BLE001
-            return {"raw": resp.text}
+            if resp.status_code == 401:
+                resp.close()
+                self.login()
+                resp = self.session.post(
+                    url,
+                    headers=self._auth_headers(),
+                    json=body or {},
+                    timeout=self.timeout,
+                    **kwargs,
+                )
+            if resp.status_code >= 400:
+                raise CMClientError(
+                    f"POST {path} failed ({resp.status_code}): {resp.text[:300]}",
+                    status_code=resp.status_code,
+                    payload=_safe_json(resp),
+                )
+            if not resp.content:
+                return None
+            try:
+                return resp.json()
+            except Exception:  # noqa: BLE001
+                return {"raw": resp.text}
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def system_info(self) -> dict[str, Any]:
         for path in ("/system/info", "/system/version", "/nodes/self"):
@@ -729,25 +773,31 @@ class CMClient:
         # Keep a longer read budget for large Prometheus dumps unless caller
         # tightened timeout (manual Refresh of possibly-dead hosts).
         scrape_timeout = self.timeout if self.timeout < 30 else max(self.timeout, 60.0)
-        resp = self.session.get(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Accept": "text/plain"},
-            timeout=scrape_timeout,
-        )
-        if resp.status_code >= 400:
-            # Token may have been rotated — refresh once
-            token = self.ensure_metrics_token()
-            resp = self.session.get(
+        def _get_metrics(bearer: str):
+            return self.session.get(
                 url,
-                headers={"Authorization": f"Bearer {token}", "Accept": "text/plain"},
+                headers={"Authorization": f"Bearer {bearer}", "Accept": "text/plain"},
                 timeout=scrape_timeout,
             )
-        if resp.status_code >= 400:
-            raise CMClientError(
-                f"Metrics scrape failed ({resp.status_code}): {resp.text[:300]}",
-                status_code=resp.status_code,
-            )
-        return parse_prometheus_text(resp.text)
+
+        resp = _get_metrics(token)
+        try:
+            if resp.status_code >= 400:
+                # Token may have been rotated — refresh once
+                token = self.ensure_metrics_token()
+                resp.close()
+                resp = _get_metrics(token)
+            if resp.status_code >= 400:
+                raise CMClientError(
+                    f"Metrics scrape failed ({resp.status_code}): {resp.text[:300]}",
+                    status_code=resp.status_code,
+                )
+            return parse_prometheus_text(resp.text)
+        finally:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def list_data_protection_clients(
         self,
