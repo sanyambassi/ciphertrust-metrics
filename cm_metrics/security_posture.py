@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .cm_version import version_at_least, version_below
+
 # Documented defaults from ksctl properties list --help (same set as healthcheck).
 DEFAULT_PROPERTIES: dict[str, str] = {
     "UI_IDLE_SESSION_TIMEOUT": "10m",
@@ -36,7 +38,33 @@ DEFAULT_PROPERTIES: dict[str, str] = {
     "ENABLE_RECORDS_DB_STORE": "false",
     "ENABLE_ML_KEM_FOR_CLUSTER": "false",
     "CLUSTER_CERT_AUTO_RENEW_THRESHOLD": "30",
+    # Present on CM 2.24+ (e.g. 2.25); default true per CM property description.
+    "KMIP_DISALLOW_AES_GCM_NO_IV": "true",
 }
+
+# Not present in CM system properties API from 2.24 onward.
+_PROPERTIES_REMOVED_FROM_224 = frozenset({"ENABLE_RECORDS_DB_STORE"})
+# Introduced in the 2.24+ property set (absent on older CM builds such as 2.23).
+_PROPERTIES_ADDED_FROM_224 = frozenset({"KMIP_DISALLOW_AES_GCM_NO_IV"})
+
+
+def defaults_for_cm_version(cm_version: Any = None) -> dict[str, str]:
+    """Documented property defaults applicable to this CM version."""
+    if version_at_least(cm_version, "2.24.0"):
+        return {
+            name: value
+            for name, value in DEFAULT_PROPERTIES.items()
+            if name not in _PROPERTIES_REMOVED_FROM_224
+        }
+    if version_below(cm_version, "2.24.0"):
+        return {
+            name: value
+            for name, value in DEFAULT_PROPERTIES.items()
+            if name not in _PROPERTIES_ADDED_FROM_224
+        }
+    # Unknown version: keep the full documented set.
+    return dict(DEFAULT_PROPERTIES)
+
 
 INSECURE_INTERFACE_MODES = frozenset(
     {
@@ -166,17 +194,22 @@ def evaluate_interfaces(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def evaluate_modified_properties(items: list[dict[str, Any]]) -> dict[str, Any]:
+def evaluate_modified_properties(
+    items: list[dict[str, Any]],
+    *,
+    cm_version: Any = None,
+) -> dict[str, Any]:
     """Flag properties whose value differs from documented defaults."""
+    defaults = defaults_for_cm_version(cm_version)
     modified: list[dict[str, str]] = []
     for row in items:
         if not isinstance(row, dict):
             continue
         name = str(row.get("name") or "")
-        if not name or name not in DEFAULT_PROPERTIES:
+        if not name or name not in defaults:
             continue
         current = "" if row.get("value") is None else str(row.get("value"))
-        default = DEFAULT_PROPERTIES[name]
+        default = defaults[name]
         if current != default:
             modified.append(
                 {
@@ -189,7 +222,7 @@ def evaluate_modified_properties(items: list[dict[str, Any]]) -> dict[str, Any]:
 
     modified.sort(key=lambda r: r["name"].lower())
     return {
-        "known_defaults": len(DEFAULT_PROPERTIES),
+        "known_defaults": len(defaults),
         "modified_count": len(modified),
         "modified": modified,
     }

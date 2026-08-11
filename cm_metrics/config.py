@@ -42,7 +42,7 @@ def _ensure_secret() -> str:
 
 class Config:
     # Bump on each Docker/GitHub release (semver: MAJOR.MINOR.PATCH).
-    APP_VERSION: str = os.getenv("APP_VERSION", "1.3.3")
+    APP_VERSION: str = os.getenv("APP_VERSION", "1.3.5")
     SECRET_KEY: str = _ensure_secret()
     DATABASE_PATH: Path = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "cm_metrics.db")))
     # Per-appliance metric SQLite files live here (metric_points + scrape_runs).
@@ -67,7 +67,7 @@ class Config:
     FLASK_DEBUG: bool = _bool(os.getenv("FLASK_DEBUG", "true"), True)
     # HTTPS is on by default; self-signed cert/key are created on first start if missing.
     FLASK_HTTPS: bool = _bool(os.getenv("FLASK_HTTPS", "true"), True)
-    # Plain HTTP alongside HTTPS (no redirect). Off by default for local; enable on Ubuntu.
+    # Plain HTTP alongside HTTPS (no redirect). Off by default; enable when needed on the host.
     FLASK_HTTP: bool = _bool(os.getenv("FLASK_HTTP", "false"), False)
     FLASK_HTTP_PORT: int = int(os.getenv("FLASK_HTTP_PORT", "80"))
     SSL_CERT_PATH: Path = Path(

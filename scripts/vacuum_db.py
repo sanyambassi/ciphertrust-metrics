@@ -9,7 +9,7 @@ Usage (from the install root, with the same env/DB path as the service):
 
     # Prefer stopping the service first so VACUUM is not fighting scrapes:
     sudo systemctl stop cm-metrics
-    sudo /opt/cm-metrics/venv/bin/python /opt/cm-metrics/scripts/vacuum_db.py
+    sudo ./venv/bin/python scripts/vacuum_db.py
     sudo systemctl start cm-metrics
 
 Needs roughly as much free disk as the largest file being rewritten.
@@ -20,7 +20,6 @@ import os
 import sys
 from pathlib import Path
 
-# Allow running from repo or /opt/cm-metrics install layout.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

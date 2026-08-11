@@ -50,6 +50,7 @@ _push*
 _deploy*
 _redeploy*
 _res_out*
+_grafana_compare/
 
 # Windows-only / non-Linux tooling
 tools/ksctl.exe

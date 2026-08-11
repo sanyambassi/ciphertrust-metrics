@@ -46,8 +46,56 @@ DEFAULT_PROPERTIES = {
     "PREVENT_DELETE_INUSE_CONNECTIONS": "true",
     "ENABLE_RECORDS_DB_STORE": "false",
     "ENABLE_ML_KEM_FOR_CLUSTER": "false",
-    "CLUSTER_CERT_AUTO_RENEW_THRESHOLD": "30"
+    "CLUSTER_CERT_AUTO_RENEW_THRESHOLD": "30",
+    # Present on CM 2.24+ (e.g. 2.25); default true per CM property description.
+    "KMIP_DISALLOW_AES_GCM_NO_IV": "true",
 }
+
+# Not present in CM system properties API from 2.24 onward.
+_PROPERTIES_REMOVED_FROM_224 = frozenset({"ENABLE_RECORDS_DB_STORE"})
+# Introduced in the 2.24+ property set (absent on older CM builds such as 2.23).
+_PROPERTIES_ADDED_FROM_224 = frozenset({"KMIP_DISALLOW_AES_GCM_NO_IV"})
+
+
+def _parse_cm_version_tuple(raw: Any) -> Optional[tuple]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
+
+
+def defaults_for_cm_version(cm_version: Any = None) -> Dict[str, str]:
+    """Documented property defaults for this CM version (2.24+ add/drop set)."""
+    ver = _parse_cm_version_tuple(cm_version)
+    if ver is not None and ver >= (2, 24, 0):
+        return {
+            name: value
+            for name, value in DEFAULT_PROPERTIES.items()
+            if name not in _PROPERTIES_REMOVED_FROM_224
+        }
+    if ver is not None and ver < (2, 24, 0):
+        return {
+            name: value
+            for name, value in DEFAULT_PROPERTIES.items()
+            if name not in _PROPERTIES_ADDED_FROM_224
+        }
+    return dict(DEFAULT_PROPERTIES)
+
+
+def _cm_version_from_data(data: Dict[str, Any]) -> Any:
+    sys_info = data.get("system_info") if isinstance(data, dict) else None
+    if not isinstance(sys_info, dict):
+        return None
+    return (
+        sys_info.get("version")
+        or sys_info.get("cm_version")
+        or sys_info.get("software_version")
+    )
 
 
 def first_present(d: Dict[str, Any], *names: str) -> Optional[Any]:
@@ -116,21 +164,25 @@ def run_ksctl_list_all(args: List[str]) -> Dict[str, Any]:
         if error is not None:
             print(f"Error executing command: {' '.join(['ksctl'] + cmd_args + ['--respfmt', 'json'])}")
             print(f"Stderr: {error}")
+            return res if isinstance(res, dict) else {"error": error}
 
         if not isinstance(res, dict) or "resources" not in res:
             return res
-            
-        resources = res.get("resources", [])
+
+        # Treat null/non-list resources as an empty page.
+        resources = res.get("resources")
+        if not isinstance(resources, list):
+            resources = []
         all_resources.extend(resources)
-        
-        total = res.get("total", 0)
+
+        total = res.get("total", 0) or 0
         limit = res.get("limit", page_size) or page_size
-        
+
         if len(all_resources) >= total or not resources or len(resources) < limit:
             break
-            
+
         skip += limit
-        
+
     res["resources"] = all_resources
     res["skip"] = 0
     res["limit"] = len(all_resources)
@@ -211,11 +263,12 @@ def filter_interesting_data(data: Dict[str, Any]) -> Dict[str, Any]:
         
     # 5. Filter Properties (Keep only modified properties)
     props_raw = data.get("properties", {}).get("resources", [])
+    prop_defaults = defaults_for_cm_version(_cm_version_from_data(data))
     interesting_props = []
     for prop in props_raw:
         name = prop.get("name")
         val = prop.get("value")
-        default_val = DEFAULT_PROPERTIES.get(name)
+        default_val = prop_defaults.get(name)
         if default_val is not None and val != default_val:
             interesting_props.append(prop)
             
@@ -1086,11 +1139,14 @@ def analyze_health(data: Dict[str, Any]) -> Dict[str, Any]:
     # 6.5 System Properties Check
     properties = data.get("properties", {}).get("resources", [])
     modified_props = []
+    prop_defaults = defaults_for_cm_version(
+        first_present(sys_info, "version", "cm_version", "software_version")
+    )
 
     for prop in properties:
         name = prop.get("name")
         val = prop.get("value")
-        default_val = DEFAULT_PROPERTIES.get(name)
+        default_val = prop_defaults.get(name)
         if default_val is not None and val != default_val:
             p_copy = dict(prop)
             p_copy["default_value"] = default_val

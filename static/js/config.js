@@ -39,3 +39,11 @@ export function getDashboardGroups() {
     { id: "overview", title: "Overview", dashboards: [{ id: "overview", title: "Overview" }] },
   ];
 }
+
+/** Replace bootstrap groups with appliance-filtered catalog (version / capability gates). */
+export function setDashboardGroups(groups) {
+  if (!window.CM_METRICS) window.CM_METRICS = {};
+  if (Array.isArray(groups) && groups.length) {
+    window.CM_METRICS.dashboardGroups = groups;
+  }
+}

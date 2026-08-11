@@ -244,6 +244,26 @@ class CMClient:
             except Exception:  # noqa: BLE001
                 pass
 
+    def query_audit_loki_range(
+        self,
+        query: str,
+        *,
+        start_ns: int,
+        end_ns: int,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Query CM Loki audit API (``/audit/loki/api/v1/query_range``)."""
+        data = self.get_json(
+            "/audit/loki/api/v1/query_range",
+            params={
+                "query": query,
+                "start": str(int(start_ns)),
+                "end": str(int(end_ns)),
+                "limit": str(max(1, min(int(limit), 5000))),
+            },
+        )
+        return data if isinstance(data, dict) else {"data": {"result": []}}
+
     def post_json(self, path: str, body: dict | None = None, **kwargs: Any) -> Any:
         url = path if path.startswith("http") else f"{self.base}{path}"
         resp = self.session.post(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..cm_version import dashboard_version_ok
 from ..store import ApplianceStore
 from .cloud import build_cckm, build_crdp, build_cte
 from .crypto import build_kmip, build_nae
@@ -133,7 +134,7 @@ DASHBOARDS: list[dict[str, Any]] = [
         "id": "resources-audit",
         "title": "Audit",
         "icon": "file-text",
-        "description": "Audit log volume, rates, and client audit logs.",
+        "description": "Audit volume from Prometheus or Loki, depending on CM capabilities.",
         "min_version": "2.7.0",
         "group": "resources",
         "builder": build_resources_audit,
@@ -331,43 +332,69 @@ DASHBOARDS: list[dict[str, Any]] = [
 
 
 
-def list_dashboards() -> list[dict[str, Any]]:
-    by_id = {d["id"]: d for d in DASHBOARDS}
+def _dashboard_public_meta(d: dict[str, Any]) -> dict[str, Any]:
+    meta = {
+        "id": d["id"],
+        "title": d["title"],
+        "icon": d["icon"],
+        "description": d["description"],
+        "min_version": d["min_version"],
+        "group": d.get("group") or _DASHBOARD_GROUP.get(d["id"], "ops"),
+    }
+    if d.get("max_version"):
+        meta["max_version"] = d["max_version"]
+    return meta
+
+
+def dashboard_available_for_appliance(
+    d: dict[str, Any],
+    appliance: dict[str, Any] | None = None,
+    store: ApplianceStore | None = None,
+) -> bool:
+    """Whether catalog entry is available for this appliance (version bounds)."""
+    del store  # Reserved for future capability gates; version bounds are sufficient today.
+    cm_version = (appliance or {}).get("cm_version") if appliance else None
+    return dashboard_version_ok(
+        cm_version,
+        min_version=d.get("min_version"),
+        max_version=d.get("max_version"),
+    )
+
+
+def list_dashboards(
+    appliance: dict[str, Any] | None = None,
+    store: ApplianceStore | None = None,
+) -> list[dict[str, Any]]:
     items = []
     for d in DASHBOARDS:
-        items.append(
-            {
-                "id": d["id"],
-                "title": d["title"],
-                "icon": d["icon"],
-                "description": d["description"],
-                "min_version": d["min_version"],
-                "group": d.get("group") or _DASHBOARD_GROUP.get(d["id"], "ops"),
-            }
-        )
+        if appliance is not None or store is not None:
+            if not dashboard_available_for_appliance(d, appliance, store):
+                continue
+        items.append(_dashboard_public_meta(d))
     # Overview pinned first; everything else A–Z by title (API consumers).
     overview = [d for d in items if d["id"] == "overview"]
     rest = sorted((d for d in items if d["id"] != "overview"), key=lambda d: d["title"].lower())
     return overview + rest
 
 
-def list_dashboard_groups() -> list[dict[str, Any]]:
+def list_dashboard_groups(
+    appliance: dict[str, Any] | None = None,
+    store: ApplianceStore | None = None,
+) -> list[dict[str, Any]]:
     """Primary tabs with ordered secondary chips for the tabbed workspace UI."""
-    by_id = {
-        d["id"]: {
-            "id": d["id"],
-            "title": d["title"],
-            "icon": d["icon"],
-            "description": d["description"],
-            "min_version": d["min_version"],
-            "group": d.get("group") or _DASHBOARD_GROUP.get(d["id"], "ops"),
-        }
-        for d in DASHBOARDS
-    }
+    by_id: dict[str, dict[str, Any]] = {}
+    for d in DASHBOARDS:
+        if appliance is not None or store is not None:
+            if not dashboard_available_for_appliance(d, appliance, store):
+                continue
+        by_id[d["id"]] = _dashboard_public_meta(d)
     groups: list[dict[str, Any]] = []
     for g in DASHBOARD_GROUPS:
         chip_ids = _GROUP_CHIP_ORDER.get(g["id"], [])
         chips = [by_id[cid] for cid in chip_ids if cid in by_id]
+        if not chips and g["id"] != "overview":
+            # Keep empty groups out of the primary tab strip when filtering.
+            continue
         groups.append({"id": g["id"], "title": g["title"], "dashboards": chips})
     return groups
 
@@ -415,6 +442,7 @@ def get_dashboard(
                 elif dashboard_id in {
                     "overview",
                     "resources-keys",
+                    "resources-audit",
                     "backups",
                     "scheduler",
                     "quorum",
@@ -434,6 +462,10 @@ def get_dashboard(
                     "range_seconds": range_seconds,
                     "panels": panels,
                 }
+                if d.get("max_version"):
+                    out["max_version"] = d["max_version"]
+                if appliance is not None or store is not None:
+                    out["available"] = dashboard_available_for_appliance(d, appliance, store)
                 if dashboard_id == "cluster" and member_stores:
                     out["fleet_cluster"] = len(member_stores) > 1
                     out["cluster_members"] = [

@@ -367,7 +367,10 @@ def build_properties(store: ApplianceStore, appliance: dict[str, Any] | None = N
     if lb_value == "":
         lb_value = "(empty)"
 
-    posture = evaluate_modified_properties(items if isinstance(items, list) else [])
+    posture = evaluate_modified_properties(
+        items if isinstance(items, list) else [],
+        cm_version=(appliance or {}).get("cm_version"),
+    )
     modified = posture.get("modified") or []
     mod_n = int(posture.get("modified_count") or 0)
 

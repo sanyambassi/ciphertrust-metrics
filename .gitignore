@@ -27,6 +27,7 @@ _*.txt
 _*.sh
 _*.json
 _res_out*
+_grafana_compare/
 docs/screenshots-review/
 
 # Local test / verification / traffic helpers (not product code)

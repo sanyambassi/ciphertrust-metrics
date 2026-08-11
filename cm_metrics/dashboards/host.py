@@ -268,7 +268,7 @@ def build_tcp(store: ApplianceStore) -> list[dict[str, Any]]:
     ]
     active_total = sum(s.value for s in active) if active else None
 
-    # Host-level TCP (node exporter) — available on both appliances.
+    # Host-level TCP counters from the node exporter.
     established = store.gauge_value("node_netstat_Tcp_CurrEstab")
     tcp_inuse = store.gauge_value("node_sockstat_TCP_inuse")
     tcp_alloc = store.gauge_value("node_sockstat_TCP_alloc")

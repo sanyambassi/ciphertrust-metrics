@@ -1,10 +1,11 @@
 # CipherTrust Metrics
 
-Standalone multi-appliance web app for **CipherTrust Manager** Prometheus metrics, REST ops snapshots, and an integrated **healthcheck** (ksctl).
+Standalone multi-appliance web app for **CipherTrust Manager** Prometheus metrics, REST ops snapshots, Loki audit (CM 2.24+), and an integrated **healthcheck** (ksctl).
 
 - Add CM appliances with host / username / password (TLS verify disabled for CM connections)
 - Dashboards for host, keys, licensing, interfaces, CTE, cluster, and more
-- Interface / properties security posture from live REST data
+- **Audit:** Prometheus counters before CM 2.24; Loki audit lite on CM 2.24+ when DB-audit Prom metrics are unavailable
+- Interface / properties security posture from live REST data (version-aware defaults, including `KMIP_DISALLOW_AES_GCM_NO_IV` on 2.24+)
 - Built-in healthcheck tab (Linux `ksctl` bundled in the Docker image)
 - SQLite history that survives restarts when you mount a volume
 
@@ -52,7 +53,7 @@ Open **http://localhost:5050** → **Appliances** → add a CM (host, username, 
 | Item | Detail |
 |------|--------|
 | Image | [`sanyambassi/ciphertrust-metrics`](https://hub.docker.com/r/sanyambassi/ciphertrust-metrics) |
-| Tags | `latest`, `1.3.3` |
+| Tags | `latest`, `1.3.5` |
 | Port | `5050` (HTTP by default in the image) |
 | Data volume | `/app/data` — SQLite DB, optional TLS certs, healthcheck reports |
 | Platform | `linux/amd64` (Apple Silicon usually runs via emulation) |

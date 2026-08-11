@@ -22,7 +22,7 @@ import {
   handleApplianceAction,
   renderFleetHealth,
   pollDeleteNotifications,
-} from "./appliances.js?v=20260722v120";
+} from "./appliances.js?v=20260811audit2";
 import {
   showHealthcheckTab,
   stopHealthcheckPoll,
@@ -40,7 +40,8 @@ import {
   syncRangePicker,
   tick,
   schedule,
-} from "./dashboard.js?v=20260723voff1";
+  refreshDashboardGroupsForAppliance,
+} from "./dashboard.js?v=20260811audit2";
 
 const dom = getDom();
 const {
@@ -369,8 +370,11 @@ autoRefresh.addEventListener("change", schedule);
 showAppliancesTab();
 syncRangePicker();
 loadAppliances()
-  .then((list) => {
+  .then(async (list) => {
     if (!list.length) openModal();
+    if (state.applianceId) {
+      await refreshDashboardGroupsForAppliance(state.applianceId);
+    }
   })
   .then(() => tick({ forceFull: true, scrape: false }))
   .then(schedule)

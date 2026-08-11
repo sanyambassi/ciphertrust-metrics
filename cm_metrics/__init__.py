@@ -415,11 +415,27 @@ def create_app() -> Flask:
 
     @app.get("/api/dashboards")
     def api_dashboards():
-        return jsonify(list_dashboards())
+        appliance_id = request.args.get("appliance_id", type=int)
+        appliance = db.get_appliance(appliance_id) if appliance_id else None
+        store_obj = None
+        if appliance:
+            snap = db.get_appliance_ops_snapshot(int(appliance["id"]))
+            if snap:
+                appliance["ops_snapshot"] = snap
+            store_obj = store.for_appliance(int(appliance["id"]))
+        return jsonify(list_dashboards(appliance, store_obj))
 
     @app.get("/api/dashboard-groups")
     def api_dashboard_groups():
-        return jsonify(list_dashboard_groups())
+        appliance_id = request.args.get("appliance_id", type=int)
+        appliance = db.get_appliance(appliance_id) if appliance_id else None
+        store_obj = None
+        if appliance:
+            snap = db.get_appliance_ops_snapshot(int(appliance["id"]))
+            if snap:
+                appliance["ops_snapshot"] = snap
+            store_obj = store.for_appliance(int(appliance["id"]))
+        return jsonify(list_dashboard_groups(appliance, store_obj))
 
     @app.get("/api/dashboards/<dashboard_id>")
     def api_dashboard(dashboard_id: str):

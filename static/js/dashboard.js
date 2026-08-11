@@ -1,4 +1,10 @@
-import { TAB_CHIP_KEY, RANGE_KEY, RANGE_OPTIONS, getDashboardGroups } from "./config.js";
+import {
+  TAB_CHIP_KEY,
+  RANGE_KEY,
+  RANGE_OPTIONS,
+  getDashboardGroups,
+  setDashboardGroups,
+} from "./config.js";
 import { state, getDom } from "./state.js";
 import {
   escapeHtml,
@@ -40,6 +46,30 @@ export function groupForDashboard(dashboardId) {
 export function dashboardsForGroup(groupId) {
   const g = getDashboardGroups().find((x) => x.id === groupId);
   return g?.dashboards || [];
+}
+
+/** Refresh secondary chips for the selected appliance (version / capability gates). */
+export async function refreshDashboardGroupsForAppliance(applianceId) {
+  const id = Number(applianceId);
+  if (!id) return getDashboardGroups();
+  try {
+    const groups = await fetchJSON(`/api/dashboard-groups?appliance_id=${id}`);
+    if (Array.isArray(groups) && groups.length) {
+      setDashboardGroups(groups);
+    }
+  } catch (_) {
+    /* keep bootstrap groups */
+  }
+  // If the active chip disappeared after filtering, fall back within the group.
+  const chips = dashboardsForGroup(state.groupId);
+  if (chips.length && !chips.some((c) => c.id === state.dashboardId)) {
+    const next = defaultChipForGroup(state.groupId);
+    state.dashboardId = next;
+    persistTabChip(state.groupId, next);
+  }
+  renderSecondaryChips();
+  renderPrimaryTabs();
+  return getDashboardGroups();
 }
 
 export function persistTabChip(groupId, dashboardId) {

@@ -284,7 +284,7 @@ def build_resources_domains(store: ApplianceStore) -> list[dict[str, Any]]:
     return panels
 
 
-def build_resources_audit(store: ApplianceStore) -> list[dict[str, Any]]:
+def _build_resources_audit_prom(store: ApplianceStore) -> list[dict[str, Any]]:
     audit_rate = store.rate("ciphertrust_audit_log_records_total", {"service": "audit_log"})
     audit_total = store.gauge_value("ciphertrust_audit_log_records_total", {"service": "audit_log"})
     audit_5m = store.increase("ciphertrust_audit_log_records_total", {"service": "audit_log"}, 300)
@@ -302,6 +302,122 @@ def build_resources_audit(store: ApplianceStore) -> list[dict[str, Any]]:
             "rec/s",
         ),
     ]
+
+
+def _fmt_window(seconds: float) -> str:
+    secs = max(0, int(seconds))
+    if secs >= 86400 and secs % 86400 == 0:
+        days = secs // 86400
+        return f"{days}d"
+    if secs >= 3600 and secs % 3600 == 0:
+        return f"{secs // 3600}h"
+    if secs >= 60 and secs % 60 == 0:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
+def _build_resources_audit_loki(appliance: dict[str, Any] | None) -> list[dict[str, Any]]:
+    from ..audit_loki import fetch_audit_lite_for_appliance
+    from .panels import dashboard_range_seconds
+
+    aid = int((appliance or {}).get("id") or 0)
+    if not aid:
+        return [
+            _note(
+                "Select an appliance to load Loki audit events.",
+                title="Audit lite",
+                tone="info",
+            )
+        ]
+
+    window = dashboard_range_seconds() or 86400.0
+    summary = fetch_audit_lite_for_appliance(aid, window_seconds=window)
+    used = float(summary.get("window_seconds") or min(window, 7 * 86400))
+    label = _fmt_window(used)
+
+    if not summary.get("ok"):
+        err = str(summary.get("error") or "Loki audit query failed")
+        return [
+            _note(
+                f"Could not load Loki audit events: {err}",
+                title="Audit lite unavailable",
+                tone="warning",
+            )
+        ]
+
+    sev_map = summary.get("severity") or {}
+    sev_bar = [
+        {"label": str(k), "value": float(v)}
+        for k, v in sev_map.items()
+    ]
+    significant = summary.get("recent_significant") or []
+    recent = significant or (summary.get("recent") or [])
+    table_title = (
+        "Recent errors / criticals" if significant else f"Recent events ({label})"
+    )
+
+    panels: list[dict[str, Any]] = [
+        _note(
+            "Showing Loki audit records (server + client)."
+            + (
+                " Lookback is capped at 7 days for this view."
+                if summary.get("capped_7d")
+                else ""
+            ),
+            title="Audit lite (Loki)",
+            tone="info",
+        ),
+        _stat("Events", float(summary.get("total") or 0), description=f"Last {label}"),
+        _stat(
+            "Errors",
+            float(summary.get("error_count") or 0),
+            tone="fail" if int(summary.get("error_count") or 0) else "",
+        ),
+        _stat(
+            "Critical / fatal",
+            float(summary.get("critical_count") or 0),
+            tone="fail" if int(summary.get("critical_count") or 0) else "",
+        ),
+        _stat("Server events", float(summary.get("server_count") or 0)),
+        _stat("Client events", float(summary.get("client_count") or 0)),
+        _bar(f"By severity ({label})", sev_bar),
+        {
+            "type": "table",
+            "title": table_title,
+            "wide": True,
+            "span": 12,
+            "columns": ["time", "severity", "source", "user", "message"],
+            "rows": [
+                {
+                    "time": r.get("time") or "",
+                    "severity": r.get("severity") or "",
+                    "source": r.get("source") or "",
+                    "user": r.get("user") or "",
+                    "message": r.get("message") or "",
+                }
+                for r in recent[:20]
+            ],
+        },
+    ]
+    if not recent:
+        panels.append(
+            _note(
+                f"No audit events returned for the last {label}.",
+                title="No events",
+                tone="pass",
+            )
+        )
+    return panels
+
+
+def build_resources_audit(
+    store: ApplianceStore, appliance: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    from ..audit_capability import supports_prom_audit_dashboard
+
+    if supports_prom_audit_dashboard(appliance, store):
+        return _build_resources_audit_prom(store)
+    return _build_resources_audit_loki(appliance)
 
 
 def build_resources_crypto_ops(store: ApplianceStore) -> list[dict[str, Any]]:
@@ -481,7 +597,7 @@ def build_resources(
         *build_resources_keys(store, appliance),
         *build_resources_licensing(store),
         *build_resources_domains(store),
-        *build_resources_audit(store),
+        *build_resources_audit(store, appliance),
         *build_resources_crypto_ops(store),
         *build_resources_hsm_backups(store),
         *build_resources_cckm(store),

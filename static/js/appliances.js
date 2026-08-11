@@ -999,6 +999,12 @@ export async function selectAppliance(id, { load = true } = {}) {
   state.panelMeta = null;
   setApplianceMenuOpen(false);
   renderApplianceList(true);
+  try {
+    const { refreshDashboardGroupsForAppliance } = await import("./dashboard.js?v=20260811audit2");
+    await refreshDashboardGroupsForAppliance(next);
+  } catch (_) {
+    /* ignore catalog refresh errors */
+  }
   if (load && state.viewMode === "dashboard") {
     await loadDashboard(state.dashboardId, { forceFull: true });
   } else if (load && state.viewMode === "healthcheck") {
@@ -1041,6 +1047,14 @@ export async function loadAppliances({ force = false } = {}) {
   }
   // Skip forced tree rebuild on Auto ticks — signature check avoids sidebar flash.
   renderApplianceList(force);
+  if (force && state.applianceId) {
+    try {
+      const { refreshDashboardGroupsForAppliance } = await import("./dashboard.js?v=20260811audit2");
+      await refreshDashboardGroupsForAppliance(state.applianceId);
+    } catch (_) {
+      /* ignore */
+    }
+  }
   return state.appliances;
 }
 
@@ -1157,7 +1171,7 @@ function renderCrdpBanner(note) {
     const action = btn.dataset.action;
     if (action === "open-crdp") {
       try {
-        const { openCrdpForAppliance } = await import("./dashboard.js");
+        const { openCrdpForAppliance } = await import("./dashboard.js?v=20260811audit2");
         await openCrdpForAppliance(note.appliance_id);
       } catch (err) {
         console.warn("open CRDP failed", err);

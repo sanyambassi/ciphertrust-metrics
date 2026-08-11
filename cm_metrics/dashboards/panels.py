@@ -33,6 +33,14 @@ def _series_since() -> float | None:
     return time.time() - float(secs)
 
 
+def dashboard_range_seconds() -> float | None:
+    """UI-selected chart window in seconds for the current dashboard request."""
+    secs = _dashboard_range_seconds.get()
+    if secs is None or secs <= 0:
+        return None
+    return float(secs)
+
+
 def _with_link(
     panel: dict[str, Any],
     *,
