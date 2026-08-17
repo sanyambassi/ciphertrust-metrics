@@ -20,11 +20,9 @@ data/
 *.pem
 *.key
 
-# Local REST healthcheck working copy (not a release artifact)
-vendor/rest_healthcheck/
-
-# Local deploy / scratch scripts (may contain host passwords, IPs, usernames)
-_*.py
+# Local deploy / scratch scripts at repo root (may contain host passwords, IPs).
+# Anchored so this does not ignore package __init__.py files.
+/_*.py
 _tmp*
 _*.txt
 _*.sh

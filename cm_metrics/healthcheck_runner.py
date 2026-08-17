@@ -1,4 +1,4 @@
-"""Background CipherTrust healthcheck runner (vendored ksctl-based tool)."""
+"""Background CipherTrust healthcheck runner (ksctl or vendored REST engine)."""
 
 from __future__ import annotations
 
@@ -22,20 +22,25 @@ import requests
 import urllib3
 
 from . import db
-from .config import ROOT
+from .config import ROOT, Config
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
 VENDOR_DIR = ROOT / "vendor" / "healthcheck"
+REST_VENDOR_LIB = ROOT / "vendor" / "rest_healthcheck" / "lib"
 TOOLS_DIR = ROOT / "tools"
 DATA_DIR = ROOT / "data" / "healthcheck"
+
+_VALID_ENGINES = frozenset({"ksctl", "rest"})
 
 _lock = threading.RLock()
 _running: dict[int, threading.Thread] = {}
 _progress: dict[int, dict[str, Any]] = {}
 _ksctl_download_lock = threading.Lock()
+# CmClient reads CM_* from process env — serialize REST runs to avoid credential races.
+_rest_run_lock = threading.Lock()
 
 # Entries inside CM /downloads/ksctl_images.zip → local tools/ filename.
 # Zip currently ships amd64 only (linux / darwin / windows).
@@ -366,6 +371,103 @@ def appliance_dir(appliance_id: int) -> Path:
     return path
 
 
+def default_engine() -> str:
+    raw = (Config.HEALTHCHECK_ENGINE or "ksctl").strip().lower()
+    return raw if raw in _VALID_ENGINES else "ksctl"
+
+
+def resolve_engine(override: str | None = None) -> str:
+    if override is not None and str(override).strip():
+        eng = str(override).strip().lower()
+        if eng not in _VALID_ENGINES:
+            raise ValueError(f"invalid healthcheck engine {override!r}; use ksctl or rest")
+        return eng
+    return default_engine()
+
+
+def rest_engine_available() -> dict[str, Any]:
+    ok = (REST_VENDOR_LIB / "healthcheck" / "runner.py").is_file()
+    return {
+        "ok": ok,
+        "path": str(REST_VENDOR_LIB) if ok else None,
+        "error": None if ok else f"REST healthcheck missing at {REST_VENDOR_LIB}",
+    }
+
+
+def _cm_api_base(host: str) -> str:
+    """Normalize appliance host to CM API base (.../api) for the REST client."""
+    text = (host or "").strip().rstrip("/")
+    if not text:
+        raise ValueError("empty CM host")
+    if "://" not in text:
+        text = f"https://{text}"
+    if text.endswith("/api"):
+        return text
+    return text + "/api"
+
+
+def _map_rest_overall(overall: str | None) -> str:
+    """Map REST overall → UI badge values (PASS / WARNING / FAIL)."""
+    key = (overall or "").upper()
+    return {
+        "OK": "PASS",
+        "PASS": "PASS",
+        "DEGRADED": "WARNING",
+        "WARNING": "WARNING",
+        "CRITICAL": "FAIL",
+        "FAIL": "FAIL",
+        "UNREACHABLE": "FAIL",
+        "UNKNOWN": "FAIL",
+    }.get(key, "FAIL")
+
+
+def _rest_report_to_analysis(report: dict[str, Any], *, engine: str = "rest") -> dict[str, Any]:
+    """Shape REST report findings into the ksctl-like analysis_summary the UI expects."""
+    sev_map = {"CRITICAL": "FAIL", "WARNING": "WARNING", "INFO": "INFO", "FAIL": "FAIL"}
+    analysis: dict[str, Any] = {
+        "status": _map_rest_overall(report.get("overall")),
+        "_meta": {"engine": engine, "rest_overall": report.get("overall")},
+    }
+    for finding in report.get("findings") or []:
+        if not isinstance(finding, dict):
+            continue
+        section = str(finding.get("area") or "system")
+        bucket = analysis.setdefault(section, {"status": "PASS", "issues": [], "metrics": {}})
+        sev = sev_map.get(str(finding.get("severity") or "").upper(), "INFO")
+        bucket["issues"].append(
+            {
+                "severity": sev,
+                "code": finding.get("code"),
+                "message": finding.get("message"),
+            }
+        )
+        rank = {"FAIL": 3, "WARNING": 2, "INFO": 1, "PASS": 0}
+        if rank.get(sev, 0) > rank.get(str(bucket.get("status") or "PASS").upper(), 0):
+            bucket["status"] = sev if sev in ("FAIL", "WARNING") else bucket.get("status") or "PASS"
+    # Prefer posture table results when present (cleaner section chips).
+    for row in ((report.get("posture") or {}).get("table") or []):
+        if not isinstance(row, dict):
+            continue
+        area = str(row.get("area") or "").strip()
+        if not area:
+            continue
+        result = str(row.get("result") or "").replace("*", "").strip().upper()
+        if result in ("WARN", "WARNING"):
+            result = "WARNING"
+        elif result in ("FAIL", "CRITICAL"):
+            result = "FAIL"
+        elif result in ("PASS", "OK"):
+            result = "PASS"
+        else:
+            continue
+        key = area.lower().replace(" ", "_")
+        bucket = analysis.setdefault(key, {"status": "PASS", "issues": [], "metrics": {}})
+        rank = {"FAIL": 3, "WARNING": 2, "PASS": 0}
+        if rank.get(result, 0) > rank.get(str(bucket.get("status") or "PASS").upper(), 0):
+            bucket["status"] = result
+    return analysis
+
+
 def _import_healthcheck_module():
     if not VENDOR_DIR.is_dir():
         raise RuntimeError(f"Vendored healthcheck missing at {VENDOR_DIR}")
@@ -426,6 +528,8 @@ def get_status(appliance_id: int) -> dict[str, Any]:
     live = get_live_progress(appliance_id)
     row = db.get_healthcheck_run(appliance_id)
     ksctl = ksctl_available()
+    rest = rest_engine_available()
+    engine_default = default_engine()
     if live and live.get("status") == "running":
         return {
             "appliance_id": appliance_id,
@@ -439,7 +543,10 @@ def get_status(appliance_id: int) -> dict[str, Any]:
             "error": None,
             "has_report": False,
             "has_json": False,
+            "engine": live.get("engine") or engine_default,
+            "engine_default": engine_default,
             "ksctl": ksctl,
+            "rest": rest,
             "last_run": row,
         }
     if row:
@@ -455,7 +562,10 @@ def get_status(appliance_id: int) -> dict[str, Any]:
             "error": row.get("error"),
             "has_report": bool(row.get("html_path") and Path(row["html_path"]).is_file()),
             "has_json": bool(row.get("json_path") and Path(row["json_path"]).is_file()),
+            "engine": row.get("engine") or engine_default,
+            "engine_default": engine_default,
             "ksctl": ksctl,
+            "rest": rest,
             "last_run": row,
         }
     return {
@@ -470,41 +580,62 @@ def get_status(appliance_id: int) -> dict[str, Any]:
         "error": None,
         "has_report": False,
         "has_json": False,
+        "engine": engine_default,
+        "engine_default": engine_default,
         "ksctl": ksctl,
+        "rest": rest,
         "last_run": None,
     }
 
 
-def start_healthcheck(appliance_id: int) -> dict[str, Any]:
+def start_healthcheck(appliance_id: int, *, engine: str | None = None) -> dict[str, Any]:
     appliance = db.get_appliance(appliance_id, include_secrets=True)
     if not appliance:
         return {"ok": False, "error": "appliance not found"}
     if not appliance.get("password"):
         return {"ok": False, "error": "could not decrypt appliance password"}
-    ksctl = ksctl_available()
-    if not ksctl.get("ok"):
-        # Pull unauthenticated ksctl_images.zip from this CM (same as CM UI downloads).
-        dl = ensure_ksctl(str(appliance.get("host") or ""))
-        ksctl = ksctl_available() if dl.get("ok") else dl
+
+    try:
+        eng = resolve_engine(engine)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if eng == "ksctl":
+        ksctl = ksctl_available()
         if not ksctl.get("ok"):
+            # Pull unauthenticated ksctl_images.zip from this CM (same as CM UI downloads).
+            dl = ensure_ksctl(str(appliance.get("host") or ""))
+            ksctl = ksctl_available() if dl.get("ok") else dl
+            if not ksctl.get("ok"):
+                return {
+                    "ok": False,
+                    "error": ksctl.get("error") or "ksctl unavailable",
+                    "ksctl": ksctl,
+                    "engine": eng,
+                }
+    else:
+        rest = rest_engine_available()
+        if not rest.get("ok"):
             return {
                 "ok": False,
-                "error": ksctl.get("error") or "ksctl unavailable",
-                "ksctl": ksctl,
+                "error": rest.get("error") or "REST healthcheck unavailable",
+                "rest": rest,
+                "engine": eng,
             }
 
     with _lock:
         existing = _running.get(appliance_id)
         if existing and existing.is_alive():
-            return {"ok": True, "started": False, "status": "running", "message": "already running"}
+            return {"ok": True, "started": False, "status": "running", "message": "already running", "engine": eng}
 
         started_at = time.time()
         _set_progress(
             appliance_id,
             status="running",
             phase="starting",
-            message="Starting healthcheck…",
+            message=f"Starting healthcheck ({eng})…",
             started_at=started_at,
+            engine=eng,
         )
         db.upsert_healthcheck_run(
             appliance_id,
@@ -514,30 +645,181 @@ def start_healthcheck(appliance_id: int) -> dict[str, Any]:
             overall=None,
             severity_counts=None,
             error=None,
-            message="Starting…",
+            message=f"Starting ({eng})…",
             html_path=None,
             json_path=None,
             analysis_path=None,
+            engine=eng,
         )
 
+        target = _run_rest_job if eng == "rest" else _run_ksctl_job
         thread = threading.Thread(
-            target=_run_job,
+            target=target,
             args=(appliance_id,),
-            name=f"healthcheck-{appliance_id}",
+            name=f"healthcheck-{eng}-{appliance_id}",
             daemon=True,
         )
         _running[appliance_id] = thread
         thread.start()
 
-    return {"ok": True, "started": True, "status": "running"}
+    return {"ok": True, "started": True, "status": "running", "engine": eng}
 
 
-def _run_job(appliance_id: int) -> None:
+def _run_rest_job(appliance_id: int) -> None:
     started_at = time.time()
     out_dir = appliance_dir(appliance_id)
     html_path = out_dir / "healthcheck_report.html"
     json_path = out_dir / "healthcheck_data.json"
     analysis_path = out_dir / "analysis_summary.json"
+    engine = "rest"
+
+    try:
+        appliance = db.get_appliance(appliance_id, include_secrets=True)
+        if not appliance:
+            raise RuntimeError("appliance not found")
+        if not rest_engine_available().get("ok"):
+            raise RuntimeError(f"REST healthcheck missing at {REST_VENDOR_LIB}")
+
+        _set_progress(
+            appliance_id,
+            phase="collecting",
+            message="Running REST healthcheck…",
+            engine=engine,
+        )
+
+        lib = str(REST_VENDOR_LIB)
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+
+        # Import after path insert; keep under lock with env so concurrent runs don't clash.
+        with _rest_run_lock:
+            from healthcheck.html_report import write_html_report, _redact  # type: ignore  # noqa: WPS433
+            from healthcheck.runner import run as rest_run  # type: ignore  # noqa: WPS433
+
+            env_keys = (
+                "CM_BASE",
+                "CM_USERNAME",
+                "CM_PASSWORD",
+                "CM_DOMAIN",
+                "CM_TLS_INSECURE",
+                "CM_TIMEOUT",
+                "CM_JWT",
+                "CM_REFRESH_TOKEN",
+            )
+            previous = {k: os.environ.get(k) for k in env_keys}
+            try:
+                os.environ["CM_BASE"] = _cm_api_base(str(appliance.get("host") or ""))
+                os.environ["CM_USERNAME"] = str(appliance.get("username") or "")
+                os.environ["CM_PASSWORD"] = str(appliance.get("password") or "")
+                domain = (appliance.get("domain") or "").strip()
+                if domain:
+                    os.environ["CM_DOMAIN"] = domain
+                else:
+                    os.environ.pop("CM_DOMAIN", None)
+                os.environ["CM_TLS_INSECURE"] = "1"
+                os.environ["CM_TIMEOUT"] = "60"
+                os.environ.pop("CM_JWT", None)
+                os.environ.pop("CM_REFRESH_TOKEN", None)
+
+                report = rest_run(
+                    domain_scope="all",
+                    keys_mode="both",
+                    max_keys=5000,
+                    max_users=500,
+                    include_cte=True,
+                )
+            finally:
+                for key, val in previous.items():
+                    if val is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = val
+
+        _set_progress(appliance_id, phase="report", message="Writing REST report…", engine=engine)
+        analysis = _rest_report_to_analysis(report if isinstance(report, dict) else {}, engine=engine)
+        with open(analysis_path, "w", encoding="utf-8") as fh:
+            json.dump(analysis, fh, indent=2, default=str)
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(_redact(report), fh, indent=2, default=str)
+        write_html_report(report, str(html_path))
+
+        finished_at = time.time()
+        summary = (report or {}).get("summary") if isinstance(report, dict) else {}
+        counts = {
+            "FAIL": int((summary or {}).get("critical") or 0),
+            "WARNING": int((summary or {}).get("warning") or 0),
+            "INFO": int((summary or {}).get("info") or 0),
+        }
+        overall = _map_rest_overall((report or {}).get("overall") if isinstance(report, dict) else None)
+        db.upsert_healthcheck_run(
+            appliance_id,
+            status="done",
+            started_at=started_at,
+            finished_at=finished_at,
+            overall=overall,
+            severity_counts=counts,
+            error=None,
+            message=f"Completed in {int(finished_at - started_at)}s (rest)",
+            html_path=str(html_path),
+            json_path=str(json_path),
+            analysis_path=str(analysis_path),
+            engine=engine,
+        )
+        _set_progress(
+            appliance_id,
+            status="done",
+            phase="done",
+            message="Healthcheck complete (rest)",
+            finished_at=finished_at,
+            overall=overall,
+            severity_counts=counts,
+            engine=engine,
+        )
+        logger.info(
+            "REST healthcheck done appliance=%s overall=%s counts=%s",
+            appliance_id,
+            overall,
+            counts,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("REST healthcheck failed appliance=%s", appliance_id)
+        finished_at = time.time()
+        err = str(exc)[:2000]
+        db.upsert_healthcheck_run(
+            appliance_id,
+            status="error",
+            started_at=started_at,
+            finished_at=finished_at,
+            overall=None,
+            severity_counts=None,
+            error=err,
+            message="Healthcheck failed (rest)",
+            html_path=str(html_path) if html_path.exists() else None,
+            json_path=str(json_path) if json_path.exists() else None,
+            analysis_path=str(analysis_path) if analysis_path.exists() else None,
+            engine=engine,
+        )
+        _set_progress(
+            appliance_id,
+            status="error",
+            phase="error",
+            message=err,
+            finished_at=finished_at,
+            error=err,
+            engine=engine,
+        )
+    finally:
+        with _lock:
+            _running.pop(appliance_id, None)
+
+
+def _run_ksctl_job(appliance_id: int) -> None:
+    started_at = time.time()
+    out_dir = appliance_dir(appliance_id)
+    html_path = out_dir / "healthcheck_report.html"
+    json_path = out_dir / "healthcheck_data.json"
+    analysis_path = out_dir / "analysis_summary.json"
+    engine = "ksctl"
 
     try:
         appliance = db.get_appliance(appliance_id, include_secrets=True)
@@ -705,19 +987,21 @@ def _run_job(appliance_id: int) -> None:
             overall=overall,
             severity_counts=counts,
             error=None,
-            message=f"Completed in {int(finished_at - started_at)}s",
+            message=f"Completed in {int(finished_at - started_at)}s (ksctl)",
             html_path=str(html_path),
             json_path=str(json_path),
             analysis_path=str(analysis_path),
+            engine=engine,
         )
         _set_progress(
             appliance_id,
             status="done",
             phase="done",
-            message="Healthcheck complete",
+            message="Healthcheck complete (ksctl)",
             finished_at=finished_at,
             overall=overall,
             severity_counts=counts,
+            engine=engine,
         )
         logger.info(
             "Healthcheck done appliance=%s overall=%s counts=%s",
@@ -737,10 +1021,11 @@ def _run_job(appliance_id: int) -> None:
             overall=None,
             severity_counts=None,
             error=err,
-            message="Healthcheck failed",
+            message="Healthcheck failed (ksctl)",
             html_path=str(html_path) if html_path.exists() else None,
             json_path=str(json_path) if json_path.exists() else None,
             analysis_path=str(analysis_path) if analysis_path.exists() else None,
+            engine=engine,
         )
         _set_progress(
             appliance_id,
@@ -749,6 +1034,7 @@ def _run_job(appliance_id: int) -> None:
             message=err,
             finished_at=finished_at,
             error=err,
+            engine=engine,
         )
     finally:
         with _lock:
@@ -784,7 +1070,7 @@ def posture_summary(appliance_id: int, *, max_findings: int = 8) -> dict[str, An
                 overall = analysis.get("status")
             order = {"FAIL": 0, "WARNING": 1, "INFO": 2}
             for section, body in analysis.items():
-                if section == "status" or not isinstance(body, dict):
+                if section in ("status", "_meta") or not isinstance(body, dict):
                     continue
                 if body.get("status"):
                     section_status[section] = body.get("status")

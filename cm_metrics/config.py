@@ -42,7 +42,7 @@ def _ensure_secret() -> str:
 
 class Config:
     # Bump on each Docker/GitHub release (semver: MAJOR.MINOR.PATCH).
-    APP_VERSION: str = os.getenv("APP_VERSION", "1.3.5")
+    APP_VERSION: str = os.getenv("APP_VERSION", "1.3.6")
     SECRET_KEY: str = _ensure_secret()
     DATABASE_PATH: Path = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "cm_metrics.db")))
     # Per-appliance metric SQLite files live here (metric_points + scrape_runs).
@@ -78,3 +78,8 @@ class Config:
     )
     DEMO_MODE: bool = _bool(os.getenv("DEMO_MODE", "false"), False)
     JWT_REFRESH_SECONDS: int = int(os.getenv("JWT_REFRESH_SECONDS", "240"))  # CM JWT ~300s
+    # Healthcheck backend: ksctl (default, vendored Jinja report) or rest (vendored REST engine).
+    # Per-run override: POST /api/appliances/<id>/healthcheck {"engine":"rest"|"ksctl"}.
+    HEALTHCHECK_ENGINE: str = (
+        (os.getenv("HEALTHCHECK_ENGINE") or "ksctl").strip().lower() or "ksctl"
+    )

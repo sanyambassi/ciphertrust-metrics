@@ -2763,6 +2763,20 @@ table.data td.mono { font-family: var(--mono); font-size: 11.5px; }
   color: var(--muted);
 }
 
+.hc-engine-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+.hc-engine-select {
+  min-width: 5.5rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.15));
+  background: var(--surface-2, rgba(0, 0, 0, 0.2));
+  color: inherit;
+}
 .hc-toolbar-actions {
   display: flex;
   gap: 8px;

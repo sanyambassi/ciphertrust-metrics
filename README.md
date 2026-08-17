@@ -6,7 +6,7 @@ Standalone multi-appliance web app for **CipherTrust Manager** Prometheus metric
 - Dashboards for host, keys, licensing, interfaces, CTE, cluster, and more
 - **Audit:** Prometheus counters before CM 2.24; Loki audit lite on CM 2.24+ when DB-audit Prom metrics are unavailable
 - Interface / properties security posture from live REST data (version-aware defaults, including `KMIP_DISALLOW_AES_GCM_NO_IV` on 2.24+)
-- Built-in healthcheck tab (Linux `ksctl` bundled in the Docker image)
+- Built-in healthcheck tab (`ksctl` by default; optional `HEALTHCHECK_ENGINE=rest` / UI engine selector — no ksctl required for REST)
 - SQLite history that survives restarts when you mount a volume
 
 Docs: [Prometheus Metrics](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cdsp-cm/page/admin/cm_admin/monitoring/metrics/index.html) · [REST Auth](https://docs-cybersec.thalesgroup.com/bundle/v2.21-cdsp-cm/page/admin/cm_admin/authentication/rest-api/index.html)
@@ -53,7 +53,7 @@ Open **http://localhost:5050** → **Appliances** → add a CM (host, username, 
 | Item | Detail |
 |------|--------|
 | Image | [`sanyambassi/ciphertrust-metrics`](https://hub.docker.com/r/sanyambassi/ciphertrust-metrics) |
-| Tags | `latest`, `1.3.5` |
+| Tags | `latest`, `1.3.6` |
 | Port | `5050` (HTTP by default in the image) |
 | Data volume | `/app/data` — SQLite DB, optional TLS certs, healthcheck reports |
 | Platform | `linux/amd64` (Apple Silicon usually runs via emulation) |

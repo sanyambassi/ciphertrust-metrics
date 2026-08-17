@@ -314,6 +314,17 @@ def create_app() -> Flask:
     def api_healthcheck_ksctl():
         return jsonify(healthcheck_runner.ksctl_available())
 
+    @app.get("/api/healthcheck/engine")
+    def api_healthcheck_engine():
+        return jsonify(
+            {
+                "default": healthcheck_runner.default_engine(),
+                "engines": ["ksctl", "rest"],
+                "ksctl": healthcheck_runner.ksctl_available(),
+                "rest": healthcheck_runner.rest_engine_available(),
+            }
+        )
+
     @app.get("/api/appliances/<int:appliance_id>/healthcheck")
     def api_healthcheck_status(appliance_id: int):
         if not db.get_appliance(appliance_id):
@@ -326,7 +337,7 @@ def create_app() -> Flask:
         findings: list[dict] = []
         if isinstance(analysis, dict):
             for section, body in analysis.items():
-                if section == "status" or not isinstance(body, dict):
+                if section in ("status", "_meta") or not isinstance(body, dict):
                     continue
                 for issue in (body.get("issues") or [])[:40]:
                     if not isinstance(issue, dict):
@@ -347,7 +358,7 @@ def create_app() -> Flask:
         status["section_status"] = {
             k: (v.get("status") if isinstance(v, dict) else None)
             for k, v in (analysis or {}).items()
-            if k != "status"
+            if k not in ("status", "_meta")
         }
         return jsonify(status)
 
@@ -355,7 +366,9 @@ def create_app() -> Flask:
     def api_healthcheck_start(appliance_id: int):
         if not db.get_appliance(appliance_id):
             return jsonify({"error": "not found"}), 404
-        result = healthcheck_runner.start_healthcheck(appliance_id)
+        payload = request.get_json(silent=True) or {}
+        engine = payload.get("engine") if isinstance(payload, dict) else None
+        result = healthcheck_runner.start_healthcheck(appliance_id, engine=engine)
         code = 200 if result.get("ok") else 400
         return jsonify(result), code
 

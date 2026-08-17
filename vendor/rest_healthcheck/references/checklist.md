@@ -1,0 +1,134 @@
+# Healthcheck checklist
+
+Read-only CipherTrust Manager REST checks. Prefer the runner
+`scripts/healthcheck.py` over ad-hoc calls.
+
+## Severity model
+
+| Severity | Meaning | Overall |
+|----------|---------|---------|
+| CRITICAL | Appliance failing, crypto floor broken, TCP interface mode, expired TLS/CA cert, or RoT key ≥ 12 months | CRITICAL |
+| WARNING | Reachable and usable, but needs attention (non-preferred interface modes, TLS/CA ≤30 days left, RoT ≥ 6 months) | DEGRADED |
+| INFO | Reported for awareness only | unchanged |
+
+## System and cluster
+
+1. Authenticate with `CM_*` (see this skill’s `SKILL.md`; optional token minting in `references/auth.md`).
+2. `GET /v1/auth/self/user`, `GET /v1/auth/self/domains`
+3. `GET /v1/system/info`
+4. `GET /v1/system/services/status` — `disabled` → INFO (intentional); other non-`started` → CRITICAL
+5. `GET /v1/cluster`, `/v1/cluster/summary`, `/v1/cluster/errors`, `/v1/nodes` — cluster errors → CRITICAL
+6. `GET /v1/system/ntp/status`, `/v1/system/ntp/servers` — no sync peer / no servers → WARNING
+7. `GET /v1/auth/banners/pre-auth` — empty → WARNING
+8. `GET /v1/locker/diskenc/status` — disk encryption posture:
+    - Not encrypted (`encryptionStatus` like `not encrypted` / no DEK) → WARNING
+    - Encrypted → INFO; expect auto-created **preboot** interface (INFO if present; WARNING if missing while encrypted)
+    - `attendedBoot` true → WARNING (manual passphrase at boot)
+9. `GET /v1/system/rot-keys` — age **≥ 12 months** → CRITICAL; **≥ 6 months** → WARNING; otherwise INFO
+10. `GET /v1/system/alarms` — active unacknowledged critical/error → CRITICAL; other active → WARNING
+11. `GET /v1/notification/smtp-servers`, `/v1/notification/email-addresses`
+12. Backups: `/v1/backupStatus`, `/v1/backups` (per auth domain; `scope=system|domain`), `/v1/backupkeys`, scheduler `database_backup` jobs
+13. `GET /v1/system/metrics/prometheus/status` — disabled → WARNING
+
+## Licensing
+
+14. `GET /v1/licensing/licenses/`, `/v1/licensing/features/`
+    - Expired active license or feature → CRITICAL
+    - Trial or dated expiry within 30 days → WARNING (summarize; do not spam one finding per feature)
+
+## Interfaces
+
+15. `GET /v1/configs/interfaces/` — paginate (default page is 10; do not use first page alone)
+    (auth modes per Thales interface auth docs)
+    - Enabled TCP mode `no-tls-*` (no TLS) → CRITICAL
+    - Enabled `tls-cert-and-pw` (preferred) → INFO
+    - Service interfaces present but none on `tls-cert-and-pw` → WARNING
+    - `interface_type=web` non-TCP mode → INFO (web cannot use tls-cert-and-pw; only supported web mode)
+    - Any other enabled auth mode (`unauth-tls-*`, `tls-pw-*`, `tls-cert-pw-opt`, …) → WARNING
+    - SSH / SNMP interfaces (any count, including multiples): report configured name/port/enabled as INFO (no mode scoring; `mode` is null)
+    - Preboot interface (auto when disk encryption is enabled): INFO when present; scored with disk encryption, not as a TLS mode finding
+    - Weak minimum TLS (`tls_1_0`, `tls_1_1`, `ssl_v3`) → CRITICAL
+    - Disabled interface → INFO
+    - Web interface PQC: enabled web `tls_groups` with any of
+      `X25519MLKEM768` / `SecP256r1MLKEM768` / `MLKEM512` / `MLKEM768` / `MLKEM1024`
+      → INFO; none enabled → WARNING (classic groups only by default)
+    - TLS server cert via `GET /v1/configs/interfaces/{name}/certificate` (leaf PEM):
+      expired → CRITICAL; ≤30 days left → WARNING; >30 days → INFO
+16. `GET /v1/configs/log-forwarders/` — none active → WARNING
+
+## Access control
+
+17. `GET /v1/usermgmt/pwdpolicies/` — weak length / no history / no lockout → WARNING; no password expiry → INFO
+18. `GET /v1/connectionmgmt/services/ldap/connections`
+    - `ldaps://` with `insecure_skip_verify` → CRITICAL
+    - `ldaps://` with no root CA → WARNING
+19. `GET /v1/configs/properties` — compare known properties to documented defaults
+    (version-aware: drop `ENABLE_RECORDS_DB_STORE` / add `KMIP_DISALLOW_AES_GCM_NO_IV` on 2.24+)
+    — any modified value → INFO (`sys_property_modified`)
+20. `GET /v1/usermgmt/groups` — custom (non-system) groups → INFO; and
+    `GET /v1/usermgmt/users/?group=admin` — admin members → INFO;
+    admin never logged in → WARNING
+21. Users (paged per accessible domain when domain inventory runs; otherwise current token domain):
+    locked, never logged in, inactive >30d, or failed logins → WARNING;
+    report top 5 users by `logins_count` (INFO + Users header; ranked after paging)
+
+## Domains and key usage
+
+22. `GET /v1/domains` — `allow_user_management` / HSM-backed → INFO
+23. `GET /v1/reports/orphaned-resources` — orphaned keys → WARNING
+24. Quorum:
+    - `GET /v1/quorum-mgmt/policy/status` (page fully; use API `total`) — policy `active: true` = **enabled** in GUI; report enabled / total policies
+    - `GET /v1/quorum-mgmt/quorums` — count requests by state; report active / pre-active / total requests
+
+## Certificate authorities
+
+25. Local / external CAs are **per-domain** (`GET /v1/ca/local-cas`, `/v1/ca/external-cas`,
+    `limit=100`): login with token `domain` like keys/backups; aggregate totals across
+    domains checked; 401/403 → skip domain (skipped ≠ clean). Trusted CAs
+    (`/v1/trusted-cas`) are appliance-scoped — check once on auth client; subdomain
+    403 → skip trusted with note.
+    - Expired → CRITICAL; ≤30 days → WARNING; >30 days → INFO
+    - Note when a CA is still referenced by an enabled interface
+    - Findings prefixed with `[domain]` for local/external
+
+## Keys
+
+26. Estate key count: scrape `GET /v1/system/metrics/prometheus` when enabled (never include scrape token).
+    Report vault **DEK** totals — do not sum per-domain license
+    `key_usage_count_including_subdomains` series (under/over-counts the estate).
+27. Per domain (weak/inactive keys + user hygiene): authenticate with token `domain` parameter,
+    then page `/v1/vault/keys2/` and `/v1/usermgmt/users/`
+    - Weak keys → WARNING: RSA &lt; 2048; any DES/DESede/3DES; AES/ARIA &lt; 128; EC size &lt; 256 or ~224-bit curves
+    - Prefer `keys2` filters (`algorithm`, repeated `size`, repeated `curveid`) to find weak candidates; `--max-keys` still caps the general vault sample (inactive/state)
+    - Highest key version inactive (not `Active`) → WARNING
+    - User hygiene + top 5 by logins (see access control)
+    - Domain auth 401/403 → skip and tell the user that domain could not be checked (not CRITICAL by itself)
+
+## CTE (on by default; disable with `--no-cte`)
+
+28. Clients: `NOT CONNECTED` with communication enabled → WARNING; `UNREGISTERED` / comm disabled → INFO
+29. GuardPoints: `DISABLED` / `ERROR` → WARNING; `UNKNOWN` → INFO
+30. Policies with `never_deny=true` (Learn Mode) → WARNING
+
+## Audit records
+
+Two pipelines: **Loki** (always on) and optional **DB store** (`ENABLE_RECORDS_DB_STORE`).
+DB store is disabled by default / removed on CM 2.24+.
+
+31. `GET /v1/configs/properties/ENABLE_RECORDS_DB_STORE`
+    - `true` → score from DB `/v1/audit/records` + `/v1/audit/client-records` (7d)
+    - `false` → report **DB audit store disabled**; score from Loki
+    - missing / 2.24+ → report DB store not available; score from Loki
+32. Loki: `GET /v1/audit/loki/api/v1/query_range` (LogQL, last 7 days)
+    - Jobs: `server_audit_records`, `client_audit_records`
+    - Count: `sum by (severity) (count_over_time({job="…"} | json [7d]))` with `step=168h`
+33. Server critical/fatal → CRITICAL; server error → WARNING; client elevated → WARNING
+
+## Overall result and exit codes
+
+| Overall | Exit | Meaning |
+|---------|------|---------|
+| OK | 0 | No CRITICAL or WARNING findings |
+| DEGRADED | 1 | WARNING findings only |
+| CRITICAL | 2 | Any CRITICAL finding, auth failure, or core services down |
+| UNREACHABLE | 2 | Network or TLS failure before API use |

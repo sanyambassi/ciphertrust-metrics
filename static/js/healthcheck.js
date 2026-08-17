@@ -39,9 +39,15 @@ function renderShell() {
     <div class="hc-toolbar">
       <div class="hc-toolbar-text">
         <h2 class="hc-title">Healthcheck</h2>
-        <p class="muted hc-sub">Runs the CipherTrust diagnostic healthcheck (ksctl) using this appliance's stored credentials.</p>
+        <p class="muted hc-sub">Runs a CipherTrust diagnostic healthcheck using this appliance's stored credentials. Choose <strong>ksctl</strong> (classic) or <strong>rest api</strong> from the Engine dropdown.</p>
       </div>
       <div class="hc-toolbar-actions">
+        <label class="hc-engine-label muted" for="hc-engine">Engine
+          <select id="hc-engine" class="hc-engine-select">
+            <option value="ksctl">ksctl</option>
+            <option value="rest">rest</option>
+          </select>
+        </label>
         <a class="btn btn-sm" id="hc-open-report" href="#" target="_blank" rel="noopener" hidden>Open report</a>
         <button type="button" class="btn btn-primary btn-sm" id="hc-run-btn">Run healthcheck</button>
       </div>
@@ -77,6 +83,9 @@ function renderShell() {
   `;
 
   document.getElementById("hc-run-btn")?.addEventListener("click", () => runHealthcheck());
+  document.getElementById("hc-engine")?.addEventListener("change", (ev) => {
+    ev.currentTarget.dataset.userPicked = "1";
+  });
 }
 
 function clearReportFrame(iframe) {
@@ -180,15 +189,28 @@ function applyStatus(data) {
     runBtn.textContent = running ? "Running…" : "Run healthcheck";
   }
 
-  if (ksctlEl) {
-    const k = data.ksctl || {};
-    if (k.ok) {
-      ksctlEl.textContent = `ksctl ready${k.path ? ` (${k.path})` : ""}`;
-    } else if (k && k.error) {
-      ksctlEl.textContent = `ksctl unavailable: ${k.error}`;
-    } else {
-      ksctlEl.textContent = "";
+  const engineSelect = document.getElementById("hc-engine");
+  if (engineSelect && !engineSelect.dataset.userPicked) {
+    const preferred = data.engine_default || data.engine || "ksctl";
+    if ([...engineSelect.options].some((o) => o.value === preferred)) {
+      engineSelect.value = preferred;
     }
+  }
+
+  if (ksctlEl) {
+    const eng = data.engine || data.engine_default || "ksctl";
+    const k = data.ksctl || {};
+    const r = data.rest || {};
+    const parts = [`engine: ${eng}`];
+    if (eng === "ksctl" || k.ok || k.error) {
+      if (k.ok) parts.push(`ksctl ready${k.path ? ` (${k.path})` : ""}`);
+      else if (k.error) parts.push(`ksctl unavailable: ${k.error}`);
+    }
+    if (eng === "rest" || r.ok === false) {
+      if (r.ok) parts.push("REST engine ready");
+      else if (r.error) parts.push(`REST unavailable: ${r.error}`);
+    }
+    ksctlEl.textContent = parts.join(" · ");
   }
 
   const sections = data.section_status || {};
@@ -316,8 +338,13 @@ export async function runHealthcheck() {
     runBtn.disabled = true;
     runBtn.textContent = "Starting…";
   }
+  const engine = document.getElementById("hc-engine")?.value || "ksctl";
   try {
-    await fetchJSON(`/api/appliances/${state.applianceId}/healthcheck`, { method: "POST" });
+    await fetchJSON(`/api/appliances/${state.applianceId}/healthcheck`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine }),
+    });
   } catch (err) {
     applyStatus({
       status: "error",

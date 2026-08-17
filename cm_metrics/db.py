@@ -352,6 +352,10 @@ def init_db() -> None:
                     conn.execute(f"ALTER TABLE appliances ADD COLUMN {col} {typedef}")
                 except sqlite3.OperationalError:
                     pass
+            try:
+                conn.execute("ALTER TABLE healthcheck_runs ADD COLUMN engine TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS notifications (
@@ -1808,6 +1812,7 @@ def upsert_healthcheck_run(
     html_path: str | None = None,
     json_path: str | None = None,
     analysis_path: str | None = None,
+    engine: str | None = None,
 ) -> None:
     init_db()
     now = time.time()
@@ -1820,8 +1825,8 @@ def upsert_healthcheck_run(
                 INSERT INTO healthcheck_runs (
                     appliance_id, status, started_at, finished_at, overall,
                     severity_counts_json, error, message, html_path, json_path,
-                    analysis_path, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    analysis_path, engine, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(appliance_id) DO UPDATE SET
                     status = excluded.status,
                     started_at = COALESCE(excluded.started_at, healthcheck_runs.started_at),
@@ -1833,6 +1838,7 @@ def upsert_healthcheck_run(
                     html_path = COALESCE(excluded.html_path, healthcheck_runs.html_path),
                     json_path = COALESCE(excluded.json_path, healthcheck_runs.json_path),
                     analysis_path = COALESCE(excluded.analysis_path, healthcheck_runs.analysis_path),
+                    engine = COALESCE(excluded.engine, healthcheck_runs.engine),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1847,6 +1853,7 @@ def upsert_healthcheck_run(
                     html_path,
                     json_path,
                     analysis_path,
+                    engine,
                     now,
                 ),
             )
