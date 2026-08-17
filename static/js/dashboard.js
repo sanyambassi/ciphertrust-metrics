@@ -28,7 +28,7 @@ import {
   renderApplianceList,
   openModal,
   renderFleetHealth,
-} from "./appliances.js?v=20260722v120";
+} from "./appliances.js?v=20260816mesh2";
 
 function chartXBounds() {
   const secs = RANGE_OPTIONS.find((r) => r.id === state.rangeId)?.seconds || 86400;

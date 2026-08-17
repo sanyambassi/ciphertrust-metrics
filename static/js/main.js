@@ -22,7 +22,7 @@ import {
   handleApplianceAction,
   renderFleetHealth,
   pollDeleteNotifications,
-} from "./appliances.js?v=20260811audit2";
+} from "./appliances.js?v=20260816mesh2";
 import {
   showHealthcheckTab,
   stopHealthcheckPoll,
@@ -41,7 +41,7 @@ import {
   tick,
   schedule,
   refreshDashboardGroupsForAppliance,
-} from "./dashboard.js?v=20260811audit2";
+} from "./dashboard.js?v=20260816mesh2";
 
 const dom = getDom();
 const {

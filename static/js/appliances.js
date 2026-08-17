@@ -1,7 +1,7 @@
 import { escapeHtml, appliancesSignature, formatCmUptime } from "./format.js";
 import { fetchJSON, refreshStatus } from "./api.js";
 import { state, getDom } from "./state.js";
-import { currentTheme } from "./theme.js";
+import { currentTheme, chartColors } from "./theme.js";
 import { initLocationFields, readLocationKey } from "./locations.js";
 
 let loadDashboard = async () => {};
@@ -767,8 +767,7 @@ function paintClusterLinks(byId, positions) {
   if (!state.fleetMapLinks) return;
   state.fleetMapLinks.clearLayers();
 
-  const isLight = currentTheme() === "light";
-  const lineColor = isLight ? "#2563eb" : "#60a5fa";
+  const palette = chartColors();
 
   /** @type {Map<number, number[]>} clusterRoot -> appliance ids with map positions */
   const clusterMembers = new Map();
@@ -780,30 +779,39 @@ function paintClusterLinks(byId, positions) {
     clusterMembers.get(root).push(id);
   }
 
+  // Stable color per cluster (sorted root ids) so refresh doesn't reshuffle hues.
+  const clusterRoots = [...clusterMembers.keys()].sort((a, b) => a - b);
+  const colorByRoot = new Map(
+    clusterRoots.map((rootId, index) => [rootId, palette[index % palette.length]])
+  );
+
   for (const [rootId, memberIds] of clusterMembers) {
     if (memberIds.length < 2) continue;
-    const hubPos = positions.get(rootId) || positions.get(memberIds[0]);
-    if (!hubPos) continue;
-
-    for (const id of memberIds) {
-      if (id === rootId) continue;
-      const pos = positions.get(id);
-      if (!pos) continue;
-      if (pos.lat === hubPos.lat && pos.lng === hubPos.lng) continue;
-      const line = L.polyline(
-        [
-          [hubPos.lat, hubPos.lng],
-          [pos.lat, pos.lng],
-        ],
-        {
-          color: lineColor,
-          weight: 2,
-          opacity: 0.75,
-          dashArray: "6 6",
-          interactive: false,
-        }
-      );
-      state.fleetMapLinks.addLayer(line);
+    const lineColor = colorByRoot.get(rootId) || palette[0];
+    // Full mesh: every mapped node links to every other (CM cluster is not a hub).
+    const ids = [...new Set(memberIds)].sort((a, b) => a - b);
+    for (let i = 0; i < ids.length; i += 1) {
+      const aPos = positions.get(ids[i]);
+      if (!aPos) continue;
+      for (let j = i + 1; j < ids.length; j += 1) {
+        const bPos = positions.get(ids[j]);
+        if (!bPos) continue;
+        if (aPos.lat === bPos.lat && aPos.lng === bPos.lng) continue;
+        const line = L.polyline(
+          [
+            [aPos.lat, aPos.lng],
+            [bPos.lat, bPos.lng],
+          ],
+          {
+            color: lineColor,
+            weight: 2,
+            opacity: 0.75,
+            dashArray: "6 6",
+            interactive: false,
+          }
+        );
+        state.fleetMapLinks.addLayer(line);
+      }
     }
   }
 }
@@ -1000,7 +1008,7 @@ export async function selectAppliance(id, { load = true } = {}) {
   setApplianceMenuOpen(false);
   renderApplianceList(true);
   try {
-    const { refreshDashboardGroupsForAppliance } = await import("./dashboard.js?v=20260811audit2");
+    const { refreshDashboardGroupsForAppliance } = await import("./dashboard.js?v=20260816mesh2");
     await refreshDashboardGroupsForAppliance(next);
   } catch (_) {
     /* ignore catalog refresh errors */
@@ -1049,7 +1057,7 @@ export async function loadAppliances({ force = false } = {}) {
   renderApplianceList(force);
   if (force && state.applianceId) {
     try {
-      const { refreshDashboardGroupsForAppliance } = await import("./dashboard.js?v=20260811audit2");
+      const { refreshDashboardGroupsForAppliance } = await import("./dashboard.js?v=20260816mesh2");
       await refreshDashboardGroupsForAppliance(state.applianceId);
     } catch (_) {
       /* ignore */
@@ -1171,7 +1179,7 @@ function renderCrdpBanner(note) {
     const action = btn.dataset.action;
     if (action === "open-crdp") {
       try {
-        const { openCrdpForAppliance } = await import("./dashboard.js?v=20260811audit2");
+        const { openCrdpForAppliance } = await import("./dashboard.js?v=20260816mesh2");
         await openCrdpForAppliance(note.appliance_id);
       } catch (err) {
         console.warn("open CRDP failed", err);
